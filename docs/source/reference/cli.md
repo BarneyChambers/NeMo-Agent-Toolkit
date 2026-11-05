@@ -625,6 +625,9 @@ Options:
                               should have the 'generated_' columns.
   --skip_completed_entries    Skip the dataset entries that have a generated
                               answer.
+  --resume                    Continue an interrupted run: keep the output
+                              directory and run only the items that did not
+                              finish.
   --endpoint TEXT             Use endpoint for running the workflow. Example:
                               http://localhost:8000/generate
   --endpoint_timeout INTEGER  HTTP response timeout in seconds. Only relevant
@@ -1324,7 +1327,6 @@ Usage: nat object-store mysql [OPTIONS] BUCKET_NAME COMMAND [ARGS]...
 Options:
   --host TEXT      MySQL host
   --port INTEGER   MySQL port
-  --db TEXT        MySQL database name
   --username TEXT  MySQL username
   --password TEXT  MySQL password
   --help           Show this message and exit.

@@ -19,6 +19,13 @@ limitations under the License.
 
 # NVIDIA NeMo Agent Toolkit Overview
 
+:::{attention}
+
+⚠️ **Deprecation Notice:** NVIDIA NeMo Agent Toolkit has been deprecated as of October 2026 and will reach end of life (EOL) by end of year **2026**. Depending on your needs, migrate to: [NeMo Relay](<https://github.com/NVIDIA/NeMo-Relay>) for observability, middleware, and governance. [NeMo Helix](<https://github.com/NVIDIA-NeMo/nemo-helix>) for a unified CLI with evaluation, optimization, and hardening capabilities. [NeMo Fabric](<https://github.com/NVIDIA/NeMo-Fabric>) for a consistent interface to run agent harnesses and custom agents.
+We recommend completing your migration before the EOL date.
+
+:::
+
 NVIDIA NeMo Agent Toolkit is a flexible, lightweight, and unifying library that allows you to easily connect existing enterprise [agents](./components/agents/index.md) to data sources and [tools](./build-workflows/functions-and-function-groups/functions.md#agents-and-tools) across any framework.
 
 ## Install
@@ -118,8 +125,10 @@ Before getting started, it's possible to run this simple workflow and many other
      # Tell NeMo Agent Toolkit which LLM to use for the agent
      nim_llm:
        _type: nim
-       model_name: meta/llama-3.1-70b-instruct
+       model_name: nvidia/nemotron-3-super-120b-a12b
        temperature: 0.0
+       chat_template_kwargs:
+         enable_thinking: false
 
    workflow:
      # Use an agent that 'reasons' and 'acts'

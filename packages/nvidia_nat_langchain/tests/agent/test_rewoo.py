@@ -98,7 +98,12 @@ async def test_build_graph(mock_rewoo_agent):
     graph = await mock_rewoo_agent.build_graph()
     assert isinstance(graph, CompiledStateGraph)
     assert list(graph.nodes.keys()) == ['__start__', 'planner', 'executor', 'solver']
-    assert graph.builder.edges == {('planner', 'executor'), ('__start__', 'planner'), ('solver', '__end__')}
+    assert graph.builder.edges == {('__start__', 'planner'), ('solver', '__end__')}
+    planner_branches = graph.builder.branches.get('planner')
+    if planner_branches:
+        planner_edge = planner_branches.get('planner_edge')
+        if planner_edge and hasattr(planner_edge, 'ends') and planner_edge.ends:
+            assert set(planner_edge.ends.keys()) == {AgentDecision.TOOL, AgentDecision.END}
     executor_branches = graph.builder.branches.get('executor')
     if executor_branches:
         conditional_edge = executor_branches.get('conditional_edge')
@@ -108,7 +113,24 @@ async def test_build_graph(mock_rewoo_agent):
 
 async def test_planner_node_no_input(mock_rewoo_agent):
     state = await mock_rewoo_agent.planner_node(ReWOOGraphState())
-    assert state["result"] == NO_INPUT_ERROR_MESSAGE
+    # ReWOOGraphState.result is an AIMessage, and the graph re-validates the
+    # state after every node, so a bare string never gets past the planner.
+    assert isinstance(state["result"], AIMessage)
+    assert state["result"].content == NO_INPUT_ERROR_MESSAGE
+
+
+async def test_no_input_returns_the_message_through_the_graph(mock_rewoo_agent):
+    graph = await mock_rewoo_agent.build_graph()
+
+    state = await graph.ainvoke(ReWOOGraphState(messages=[HumanMessage(content="")], task=HumanMessage(content="")))
+
+    assert ReWOOGraphState(**state).result.content == NO_INPUT_ERROR_MESSAGE
+
+
+async def test_planner_edge_runs_the_executor_when_there_is_a_plan(mock_rewoo_agent):
+    assert await mock_rewoo_agent.planner_edge(ReWOOGraphState()) == AgentDecision.TOOL
+    assert await mock_rewoo_agent.planner_edge(ReWOOGraphState(result=AIMessage(content=NO_INPUT_ERROR_MESSAGE))
+                                               ) == AgentDecision.END
 
 
 async def test_conditional_edge_no_input(mock_rewoo_agent):
@@ -344,6 +366,40 @@ async def test_executor_node_should_not_be_invoked_after_all_steps_executed(mock
     # After executing all the steps, the executor_node should not be invoked
     with pytest.raises(RuntimeError):
         await mock_rewoo_agent.executor_node(mock_state)
+
+
+@pytest.mark.parametrize(
+    "content, expected_result",
+    [
+        ("plain text", "plain text"),
+        ([{
+            "a": 1
+        }], "{'a': 1}"),
+        (["doc one", "doc two"], "doc one"),
+        ([], ""),
+    ],
+)
+async def test_solver_node_handles_every_tool_content_shape(mock_rewoo_agent, content, expected_result):
+    # ToolMessage.content is str | list[str | dict], so a list of strings and an
+    # empty list are both shapes a NAT function can produce.
+    step = _create_step_info("find stuff", "#E1", "search", "q")
+    state = _create_mock_state_with_parallel_data([step], {"#E1": ToolMessage(content=content, tool_call_id="#E1")})
+
+    with patch.object(ReWOOAgentGraph, "_stream_llm", autospec=True) as stream_llm:
+        stream_llm.return_value = AIMessage(content="answer")
+        result = await mock_rewoo_agent.solver_node(state)
+
+    assert result["result"].content == "answer"
+    solver_chain = stream_llm.call_args.args[1]
+    plan = solver_chain.steps[0].partial_variables["plan"]
+    assert plan == f"Plan: find stuff\n#E1 = search[q]\nResult: {expected_result}\n\n"
+
+
+def test_tool_output_value(mock_rewoo_agent):
+    assert mock_rewoo_agent._tool_output_value(ToolMessage(content="text", tool_call_id="#E1")) == "text"
+    assert mock_rewoo_agent._tool_output_value(ToolMessage(content=[{"a": 1}], tool_call_id="#E1")) == {"a": 1}
+    assert mock_rewoo_agent._tool_output_value(ToolMessage(content=["one", "two"], tool_call_id="#E1")) == "one"
+    assert mock_rewoo_agent._tool_output_value(ToolMessage(content=[], tool_call_id="#E1")) == ""
 
 
 def test_validate_planner_prompt_no_input():
@@ -1094,3 +1150,82 @@ async def test_parallel_execution_flow(mock_rewoo_agent):
     # Check conditional edge - should be END now
     decision = await mock_rewoo_agent.conditional_edge(state)
     assert decision == AgentDecision.END
+
+
+async def test_rewoo_workflow_reports_the_token_usage_the_model_reported():
+    """`usage` on the response is the sum of what the planner and solver calls reported, not a word count."""
+    import json
+    import typing
+    from unittest.mock import AsyncMock
+
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.outputs import ChatGeneration
+    from langchain_core.outputs import ChatResult
+    from langchain_core.tools import tool
+
+    from nat.data_models.api_server import ChatRequestOrMessage
+    from nat.plugins.langchain.agent.rewoo_agent.register import rewoo_agent_workflow
+
+    @tool
+    def counter(q: str) -> str:
+        """Counts its calls."""
+        return "counted"
+
+    plan = json.dumps([{
+        "plan": "count", "evidence": {
+            "placeholder": "#E1", "tool": "counter", "tool_input": {
+                "q": "x"
+            }
+        }
+    }])
+
+    class UsageReportingLLM(BaseChatModel):
+        replies: list[tuple[str, int, int]]
+        turns: int = 0
+
+        @property
+        def _llm_type(self) -> str:
+            return "usage-reporting"
+
+        def _generate(self,
+                      messages: typing.Any,
+                      stop: typing.Any = None,
+                      run_manager: typing.Any = None,
+                      **kwargs: typing.Any) -> ChatResult:
+            text, input_tokens, output_tokens = self.replies[self.turns]
+            self.turns += 1
+            message = AIMessage(content=text,
+                                usage_metadata={
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                    "total_tokens": input_tokens + output_tokens,
+                                })
+            return ChatResult(generations=[ChatGeneration(message=message)])
+
+    builder = AsyncMock()
+    builder.get_llm = AsyncMock(return_value=UsageReportingLLM(replies=[(plan, 100, 20), ("all done", 150, 30)]))
+    builder.get_tools = AsyncMock(return_value=[counter])
+    config = ReWOOAgentWorkflowConfig(tool_names=["counter"], llm_name="llm")
+    request = ChatRequestOrMessage(messages=[{"role": "user", "content": "hi"}])
+    async with rewoo_agent_workflow(config, builder) as function_info:
+        response = await function_info.single_fn(request)
+    assert response.choices[0].message.content == "all done"
+    assert (response.usage.prompt_tokens, response.usage.completion_tokens,
+            response.usage.total_tokens) == (250, 50, 300)
+
+    # Run inside a parent runnable: the parent's callbacks still see the model calls, and usage is still summed.
+    from langchain_core.callbacks import AsyncCallbackHandler
+    from langchain_core.runnables import RunnableLambda
+
+    class CountLLMEnds(AsyncCallbackHandler):
+        calls: int = 0
+
+        async def on_llm_end(self, *args: typing.Any, **kwargs: typing.Any) -> None:
+            type(self).calls += 1
+
+    builder.get_llm = AsyncMock(return_value=UsageReportingLLM(replies=[(plan, 100, 20), ("all done", 150, 30)]))
+    async with rewoo_agent_workflow(config, builder) as function_info:
+        response = await RunnableLambda(function_info.single_fn).ainvoke(request,
+                                                                         config={"callbacks": [CountLLMEnds()]})
+    assert CountLLMEnds.calls == 2
+    assert response.usage.total_tokens == 300

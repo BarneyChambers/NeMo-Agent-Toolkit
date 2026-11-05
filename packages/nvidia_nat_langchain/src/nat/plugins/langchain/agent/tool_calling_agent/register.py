@@ -37,6 +37,8 @@ from nat.data_models.api_server import ChatResponseChunkChoice
 from nat.data_models.api_server import ChoiceDelta
 from nat.data_models.api_server import ChoiceDeltaToolCall
 from nat.data_models.api_server import ChoiceDeltaToolCallFunction
+from nat.data_models.api_server import PromptTokensDetails
+from nat.data_models.api_server import Usage
 from nat.data_models.component_ref import FunctionGroupRef
 from nat.data_models.component_ref import FunctionRef
 from nat.utils.type_converter import GlobalTypeConverter
@@ -113,6 +115,7 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
     from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraph
     from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraphState
     from nat.plugins.langchain.agent.tool_calling_agent.agent import create_tool_calling_agent_prompt
+    from nat.plugins.langchain.agent.tool_calling_agent.agent import extract_token_usage
 
     prompt = create_tool_calling_agent_prompt(config)
     # we can choose an LLM for the ReAct agent in the config file
@@ -139,6 +142,7 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
         max_truncation_retries=config.truncation_retry.max_retries,
         truncation_scaling_fn=config.truncation_retry.build_scaling_fn(),
         max_empty_response_retries=config.max_empty_response_retries,
+        max_iterations=config.max_iterations,
     ).build_graph()
 
     async def _response_fn(chat_request_or_message: ChatRequestOrMessage) -> str:
@@ -167,9 +171,8 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
 
             # run the Tool Calling Agent Graph
             state = await graph.ainvoke(state, config={'recursion_limit': (config.max_iterations + 1) * 2})
-            # setting recursion_limit: 4 allows 1 tool call
-            #   - allows the Tool Calling Agent to perform 1 cycle / call 1 single tool,
-            #   - but stops the agent when it tries to call a tool a second time
+            # setting recursion_limit: 4 leaves room for 1 tool call and the final answer;
+            #   the Tool Calling Agent graph itself stops before a second tool call
 
             # get and return the output from the state
             state = ToolCallAgentGraphState(**state)
@@ -207,6 +210,17 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
         chunk_id = str(uuid.uuid4())
         try:
             message = GlobalTypeConverter.get().convert(chat_request_or_message, to_type=ChatRequest)
+            # OpenAI sends one extra chunk carrying usage, with no choices, after the last content
+            # chunk, and only when the caller asked for it. The streaming LLM reports its own
+            # usage (stream_usage=True), so that is what the chunk carries - not an estimate.
+            include_usage = bool((message.stream_options or {}).get("include_usage"))
+            usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            # Tracked separately from `saw_usage`: a provider can report prompt/completion tokens
+            # without reporting which of them were cached, and the two absences mean different
+            # things to a cost estimate.
+            cached_total = 0
+            saw_cached = False
+            saw_usage = False
 
             messages: list[BaseMessage] = trim_messages(messages=[m.model_dump() for m in message.messages],
                                                         max_tokens=config.max_history,
@@ -215,15 +229,38 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
                                                         start_on="human",
                                                         include_system=True)
             state = ToolCallAgentGraphState(messages=messages)
+            # A turn's tool calls are only sent once the tool node has run them: the graph can end without
+            # running them (max_iterations, or no valid tool call), and the client must not see a call that never ran.
+            held_tool_call_chunks: list[ChatResponseChunk] = []
 
-            async for msg, metadata in graph.astream(
+            async for mode, event in graph.astream(
                     state,
                     config={'recursion_limit': (config.max_iterations + 1) * 2},
-                    stream_mode="messages"):
+                    stream_mode=["messages", "updates"]):
+                if mode == "updates":
+                    if "tool" in event:
+                        for held in held_tool_call_chunks:
+                            yield held
+                        held_tool_call_chunks = []
+                    continue
+                msg, metadata = event
                 if not isinstance(msg, AIMessageChunk):
                     continue
                 if metadata.get("langgraph_node") != "agent":
                     continue
+
+                # Each agent LLM call reports its own usage; a turn can make several (one per tool
+                # round), so they are summed rather than overwritten.
+                usage = extract_token_usage(msg)
+                if usage is not None:
+                    usage_totals["prompt_tokens"] += usage["input_tokens"]
+                    usage_totals["completion_tokens"] += usage["output_tokens"]
+                    usage_totals["total_tokens"] += usage["total_tokens"]
+                    cached = (usage.get("input_token_details") or {}).get("cache_read")
+                    if cached is not None:
+                        cached_total += cached
+                        saw_cached = True
+                    saw_usage = True
 
                 chunk_text = _extract_message_text(msg.content)
                 if chunk_text:
@@ -245,19 +282,33 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
                                                     name=tc.get("name"),
                                                     arguments=args,
                                                 )))
-                    yield ChatResponseChunk(
-                        id=chunk_id,
-                        choices=[
-                            ChatResponseChunkChoice(
-                                index=0,
-                                delta=ChoiceDelta(tool_calls=delta_tool_calls),
-                                finish_reason=None,
-                            )
-                        ],
-                        created=datetime.datetime.now(datetime.UTC),
-                        model=UNKNOWN_MODEL_SENTINEL,
-                        object="chat.completion.chunk",
-                    )
+                    held_tool_call_chunks.append(
+                        ChatResponseChunk(
+                            id=chunk_id,
+                            choices=[
+                                ChatResponseChunkChoice(
+                                    index=0,
+                                    delta=ChoiceDelta(tool_calls=delta_tool_calls),
+                                    finish_reason=None,
+                                )
+                            ],
+                            created=datetime.datetime.now(datetime.UTC),
+                            model=UNKNOWN_MODEL_SENTINEL,
+                            object="chat.completion.chunk",
+                        ))
+
+            if include_usage and saw_usage:
+                yield ChatResponseChunk(
+                    id=chunk_id,
+                    choices=[],
+                    created=datetime.datetime.now(datetime.UTC),
+                    model=UNKNOWN_MODEL_SENTINEL,
+                    object="chat.completion.chunk",
+                    usage=Usage(
+                        **usage_totals,
+                        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_total) if saw_cached else None,
+                    ),
+                )
         except GraphRecursionError:
             logger.warning(
                 "%s Tool Calling Agent reached its maximum iteration limit (%d) without producing a final answer. "

@@ -88,12 +88,13 @@ class EvalDatasetJsonConfig(EvalDatasetBaseConfig, name="json"):
 
     @staticmethod
     def parser() -> tuple[Callable, dict]:
-        return pd.read_json, {}
+        # Keep values as written, like the jsonl loader: no string-to-number or string-to-date conversion.
+        return pd.read_json, {"dtype": False, "convert_dates": False}
 
 
 def read_jsonl(file_path: FilePath):
     with open(file_path, encoding='utf-8') as f:
-        data = [json.loads(line) for line in f]
+        data = [json.loads(line) for line in f if line.strip()]
     return pd.DataFrame(data)
 
 

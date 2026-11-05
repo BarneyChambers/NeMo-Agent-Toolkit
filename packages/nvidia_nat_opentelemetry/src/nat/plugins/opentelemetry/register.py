@@ -13,9 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import ipaddress
 import logging
 import os
 from typing import Literal
+from urllib.parse import unquote
+from urllib.parse import urlparse
 
 from pydantic import Field
 
@@ -69,8 +73,6 @@ class LangfuseTelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, n
 @register_telemetry_exporter(config_type=LangfuseTelemetryExporter)
 async def langfuse_telemetry_exporter(config: LangfuseTelemetryExporter, builder: Builder):
 
-    import base64
-
     from nat.plugins.opentelemetry import OTLPSpanAdapterExporter
 
     secret_key = get_secret_value(config.secret_key) if config.secret_key else os.environ.get("LANGFUSE_SECRET_KEY")
@@ -82,13 +84,16 @@ async def langfuse_telemetry_exporter(config: LangfuseTelemetryExporter, builder
     auth_header = base64.b64encode(credentials).decode("utf-8")
     headers = {"Authorization": f"Basic {auth_header}"}
 
-    yield OTLPSpanAdapterExporter(endpoint=config.endpoint,
-                                  headers=headers,
-                                  batch_size=config.batch_size,
-                                  flush_interval=config.flush_interval,
-                                  max_queue_size=config.max_queue_size,
-                                  drop_on_overflow=config.drop_on_overflow,
-                                  shutdown_timeout=config.shutdown_timeout)
+    yield OTLPSpanAdapterExporter(
+        endpoint=config.endpoint,
+        headers=headers,
+        resource_attributes=config.resource_attributes,
+        batch_size=config.batch_size,
+        flush_interval=config.flush_interval,
+        max_queue_size=config.max_queue_size,
+        drop_on_overflow=config.drop_on_overflow,
+        shutdown_timeout=config.shutdown_timeout,
+    )
 
 
 class LangsmithTelemetryExporter(BatchConfigMixin, CollectorConfigMixin, TelemetryExporterBaseConfig, name="langsmith"):
@@ -100,9 +105,8 @@ class LangsmithTelemetryExporter(BatchConfigMixin, CollectorConfigMixin, Telemet
     )
     api_key: SerializableSecretStr = Field(description="The Langsmith API key",
                                            default_factory=lambda: SerializableSecretStr(""))
-    workspace_id: str = Field(default="",
-                              description="The Langsmith workspace ID. "
-                              "Falls back to LANGSMITH_WORKSPACE_ID env var if not set.")
+    workspace_id: str = Field(
+        default="", description="The Langsmith workspace ID. Falls back to LANGSMITH_WORKSPACE_ID env var if not set.")
     resource_attributes: dict[str, str] = Field(default_factory=dict,
                                                 description="The resource attributes to add to the span")
 
@@ -118,17 +122,20 @@ async def langsmith_telemetry_exporter(config: LangsmithTelemetryExporter, build
         raise ValueError("API key is required for langsmith")
 
     headers = {"x-api-key": api_key, "Langsmith-Project": config.project}
-    workspace_id = config.workspace_id or os.environ.get("LANGSMITH_WORKSPACE_ID") or os.environ.get(
-        "LANGCHAIN_WORKSPACE_ID")
+    workspace_id = (config.workspace_id or os.environ.get("LANGSMITH_WORKSPACE_ID")
+                    or os.environ.get("LANGCHAIN_WORKSPACE_ID"))
     if workspace_id:
         headers["X-Tenant-Id"] = workspace_id
-    yield OTLPSpanAdapterExporter(endpoint=config.endpoint,
-                                  headers=headers,
-                                  batch_size=config.batch_size,
-                                  flush_interval=config.flush_interval,
-                                  max_queue_size=config.max_queue_size,
-                                  drop_on_overflow=config.drop_on_overflow,
-                                  shutdown_timeout=config.shutdown_timeout)
+    yield OTLPSpanAdapterExporter(
+        endpoint=config.endpoint,
+        headers=headers,
+        resource_attributes=config.resource_attributes,
+        batch_size=config.batch_size,
+        flush_interval=config.flush_interval,
+        max_queue_size=config.max_queue_size,
+        drop_on_overflow=config.drop_on_overflow,
+        shutdown_timeout=config.shutdown_timeout,
+    )
 
 
 class OtelCollectorTelemetryExporter(BatchConfigMixin,
@@ -159,13 +166,15 @@ async def otel_telemetry_exporter(config: OtelCollectorTelemetryExporter, builde
     # Merge defaults with config, giving precedence to config
     merged_resource_attributes = {**default_resource_attributes, **config.resource_attributes}
 
-    yield OTLPSpanAdapterExporter(endpoint=config.endpoint,
-                                  resource_attributes=merged_resource_attributes,
-                                  batch_size=config.batch_size,
-                                  flush_interval=config.flush_interval,
-                                  max_queue_size=config.max_queue_size,
-                                  drop_on_overflow=config.drop_on_overflow,
-                                  shutdown_timeout=config.shutdown_timeout)
+    yield OTLPSpanAdapterExporter(
+        endpoint=config.endpoint,
+        resource_attributes=merged_resource_attributes,
+        batch_size=config.batch_size,
+        flush_interval=config.flush_interval,
+        max_queue_size=config.max_queue_size,
+        drop_on_overflow=config.drop_on_overflow,
+        shutdown_timeout=config.shutdown_timeout,
+    )
 
 
 class PatronusTelemetryExporter(BatchConfigMixin, CollectorConfigMixin, TelemetryExporterBaseConfig, name="patronus"):
@@ -191,21 +200,26 @@ async def patronus_telemetry_exporter(config: PatronusTelemetryExporter, builder
         "x-api-key": api_key,
         "pat-project-name": config.project,
     }
-    yield OTLPSpanAdapterExporter(endpoint=config.endpoint,
-                                  headers=headers,
-                                  batch_size=config.batch_size,
-                                  flush_interval=config.flush_interval,
-                                  max_queue_size=config.max_queue_size,
-                                  drop_on_overflow=config.drop_on_overflow,
-                                  shutdown_timeout=config.shutdown_timeout,
-                                  protocol="grpc")
+    yield OTLPSpanAdapterExporter(
+        endpoint=config.endpoint,
+        headers=headers,
+        resource_attributes=config.resource_attributes,
+        batch_size=config.batch_size,
+        flush_interval=config.flush_interval,
+        max_queue_size=config.max_queue_size,
+        drop_on_overflow=config.drop_on_overflow,
+        shutdown_timeout=config.shutdown_timeout,
+        protocol="grpc",
+    )
 
 
 class GalileoTelemetryExporter(BatchConfigMixin, CollectorConfigMixin, TelemetryExporterBaseConfig, name="galileo"):
     """A telemetry exporter to transmit traces to externally hosted galileo service."""
 
-    endpoint: str = Field(description="The galileo endpoint to export telemetry traces.",
-                          default="https://app.galileo.ai/api/galileo/otel/traces")
+    endpoint: str = Field(
+        description="The galileo endpoint to export telemetry traces.",
+        default="https://app.galileo.ai/api/galileo/otel/traces",
+    )
     logstream: str = Field(description="The logstream name to group the telemetry traces.")
     api_key: SerializableSecretStr = Field(description="The api key to authenticate with the galileo service.")
 
@@ -233,14 +247,124 @@ async def galileo_telemetry_exporter(config: GalileoTelemetryExporter, builder: 
     )
 
 
-# MLflow routes OTLP traces to an experiment via this header
-# (matches mlflow.tracing.utils.otlp.MLFLOW_EXPERIMENT_ID_HEADER).
-_MLFLOW_EXPERIMENT_ID_HEADER = "x-mlflow-experiment-id"
+class WeaveOtelTelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, name="weave_otel"):
+    """A telemetry exporter to transmit traces to Weights & Biases Weave via OTel."""
+
+    endpoint: str = Field(
+        description="The W&B Weave OTel endpoint",
+        default="https://trace.wandb.ai/otel/v1/traces",
+    )
+    api_key: SerializableSecretStr = Field(description="The W&B API key",
+                                           default_factory=lambda: SerializableSecretStr(""))
+    project: str = Field(description="The W&B project name.")
+    entity: str = Field(description="The W&B username or team name.")
+
+
+@register_telemetry_exporter(config_type=WeaveOtelTelemetryExporter)
+async def weave_otel_telemetry_exporter(config: WeaveOtelTelemetryExporter, builder: Builder):
+    """Create a Weave OTel telemetry exporter."""
+
+    from nat.plugins.opentelemetry import OTLPSpanAdapterExporter
+
+    api_key = get_secret_value(config.api_key) if config.api_key else os.environ.get("WANDB_API_KEY")
+    if not api_key:
+        raise ValueError("API key is required for Weave (set api_key or WANDB_API_KEY env var)")
+
+    headers = {"wandb-api-key": api_key}
+    resource_attributes = {
+        "wandb.project": config.project,
+        "wandb.entity": config.entity,
+    }
+
+    yield OTLPSpanAdapterExporter(
+        endpoint=config.endpoint,
+        headers=headers,
+        resource_attributes=resource_attributes,
+        batch_size=config.batch_size,
+        flush_interval=config.flush_interval,
+        max_queue_size=config.max_queue_size,
+        drop_on_overflow=config.drop_on_overflow,
+        shutdown_timeout=config.shutdown_timeout,
+    )
 
 
 def _mlflow_experiment_headers(experiment_id: str) -> dict[str, str]:
     """Build the OTLP header that routes traces to an MLflow experiment (matches MLflow's own ingestion)."""
-    return {_MLFLOW_EXPERIMENT_ID_HEADER: experiment_id}
+    return {"x-mlflow-experiment-id": experiment_id}
+
+
+def _parse_otel_env_headers() -> dict[str, str]:
+    """Parse OTEL_EXPORTER_OTLP_HEADERS (comma-separated key=value pairs) into a header dict.
+
+    The OTEL spec encodes these headers like W3C Baggage, so percent-encoded keys
+    and values are decoded (e.g. ``Authorization=Bearer%20token``).
+
+    These are the lowest-precedence layer: explicit exporter config wins on key conflict.
+    """
+    parsed: dict[str, str] = {}
+    for pair in os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "").split(","):
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if key and sep:
+            parsed[unquote(key)] = unquote(value.strip())
+    return parsed
+
+
+def _warn_on_cleartext_credentials(*, endpoint: str, headers: dict[str, str]) -> None:
+    """Warn when bearer/basic credentials would travel over non-loopback plain HTTP.
+
+    The documented local loopback default stays silent and keeps working. A warning
+    (rather than a hard rejection) preserves existing internal-network HTTP tracking
+    servers while surfacing the cleartext-credential risk (CWE-319).
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "http":
+        return
+    host = (parsed.hostname or "").lower()
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host in {"localhost", ""}
+    if is_loopback:
+        return
+    if any(v.lower().startswith(("bearer ", "basic ")) for k, v in headers.items() if k.lower() == "authorization"):
+        logger.warning(
+            "MLflow telemetry exporter sends credentials over unencrypted HTTP to %s; "
+            "use an HTTPS endpoint for non-local tracking servers.",
+            endpoint,
+        )
+
+
+def _merge_headers(*layers: dict[str, str] | None) -> dict[str, str]:
+    """Merge header layers with case-insensitive names; later layers win.
+
+    HTTP header names are case-insensitive, but a plain-dict merge keeps both
+    case variants (e.g. ``Authorization`` and ``authorization``). A later
+    consumer such as ``requests``' ``CaseInsensitiveDict`` would then keep
+    only the last-inserted variant, silently breaking the intended precedence.
+    Normalizing names at the merge boundary keeps the documented precedence:
+    OTEL env < config headers < auth headers < experiment-id routing header.
+    """
+    merged: dict[str, str] = {}
+    for layer in layers:
+        for name, value in (layer or {}).items():
+            merged[name.lower()] = value
+    return merged
+
+
+def _mlflow_auth_headers(*, token: str | None, username: str, password: str | None) -> dict[str, str]:
+    """Build the Authorization header for the MLflow exporter.
+
+    Bearer token takes precedence over basic auth, matching the MLflow Python client.
+    """
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    if username or password:
+        if not username or not password:
+            raise ValueError("username and password are both required for MLflow basic auth")
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        return {"Authorization": f"Basic {credentials}"}
+    return {}
 
 
 class MLflowTelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, name="mlflow"):
@@ -250,6 +374,12 @@ class MLflowTelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, nam
     experiment via the ``x-mlflow-experiment-id`` header. Point ``endpoint`` at that path and set
     ``experiment_id`` to the target experiment. The tracking server must run with a database backend
     store for trace ingestion.
+
+    When the tracking server sits behind authentication, provide ``token`` (bearer, mirroring
+    MLflow's MLFLOW_TRACKING_TOKEN) or ``username`` and ``password`` (basic, mirroring MLflow's
+    MLFLOW_TRACKING_USERNAME/MLFLOW_TRACKING_PASSWORD). A token takes precedence over basic auth.
+    Extra headers can be supplied via ``headers``; they are merged with (not replaced by)
+    OTEL_EXPORTER_OTLP_HEADERS and the experiment-id routing header.
     """
 
     endpoint: str = Field(
@@ -261,6 +391,28 @@ class MLflowTelemetryExporter(BatchConfigMixin, TelemetryExporterBaseConfig, nam
         description="MLflow experiment ID that traces are routed to. If empty, uses the MLFLOW_EXPERIMENT_ID "
         "environment variable, otherwise the default experiment (\"0\").",
     )
+    token: SerializableSecretStr = Field(
+        default_factory=lambda: SerializableSecretStr(""),
+        description="Bearer token for tracking servers behind authentication. "
+        "If empty, uses the MLFLOW_TRACKING_TOKEN environment variable.",
+    )
+    username: str = Field(
+        default="",
+        description="Username for basic auth against tracking servers behind authentication. "
+        "If empty, uses the MLFLOW_TRACKING_USERNAME environment variable. "
+        "Both username and password must be set.",
+    )
+    password: SerializableSecretStr = Field(
+        default_factory=lambda: SerializableSecretStr(""),
+        description="Password for basic auth against tracking servers behind authentication. "
+        "If empty, uses the MLFLOW_TRACKING_PASSWORD environment variable. "
+        "Both username and password must be set.",
+    )
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Extra HTTP headers sent to the tracking server. Merged with the "
+        "experiment-id routing header, the auth headers above, and OTEL_EXPORTER_OTLP_HEADERS.",
+    )
 
 
 @register_telemetry_exporter(config_type=MLflowTelemetryExporter)
@@ -271,9 +423,22 @@ async def mlflow_telemetry_exporter(config: MLflowTelemetryExporter, builder: Bu
 
     experiment_id = (config.experiment_id or os.environ.get("MLFLOW_EXPERIMENT_ID") or "0").strip()
 
+    token = get_secret_value(config.token) if config.token else os.environ.get("MLFLOW_TRACKING_TOKEN")
+    username = (config.username or os.environ.get("MLFLOW_TRACKING_USERNAME") or "").strip()
+    password = get_secret_value(config.password) if config.password else os.environ.get("MLFLOW_TRACKING_PASSWORD")
+
+    headers = _merge_headers(
+        _parse_otel_env_headers(),
+        config.headers,
+        _mlflow_auth_headers(token=token, username=username, password=password),
+        _mlflow_experiment_headers(experiment_id),
+    )
+
+    _warn_on_cleartext_credentials(endpoint=config.endpoint, headers=headers)
+
     yield OTLPSpanAdapterExporter(
         endpoint=config.endpoint,
-        headers=_mlflow_experiment_headers(experiment_id),
+        headers=headers,
         batch_size=config.batch_size,
         flush_interval=config.flush_interval,
         max_queue_size=config.max_queue_size,

@@ -34,6 +34,7 @@ from langchain_core.prompts import MessagesPlaceholder
 from langchain_core.runnables import Runnable
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel
 from pydantic import Field
 
@@ -46,17 +47,62 @@ from nat.plugins.langchain.agent.base import AgentDecision
 from nat.plugins.langchain.agent.base import _extract_message_text
 from nat.plugins.langchain.agent.base import _format_agent_thoughts_for_log
 from nat.plugins.langchain.agent.dual_node import DualNodeAgent
+from nat.plugins.langchain.agent.react_agent.output_parser import FINAL_ANSWER_PATTERN
 from nat.plugins.langchain.agent.react_agent.output_parser import ReActAgentParsingFailedError
 from nat.plugins.langchain.agent.react_agent.output_parser import ReActOutputParser
 from nat.plugins.langchain.agent.react_agent.output_parser import ReActOutputParserException
 from nat.plugins.langchain.agent.react_agent.prompt import SYSTEM_PROMPT
 from nat.plugins.langchain.agent.react_agent.prompt import USER_PROMPT
+from nat.plugins.langchain.agent.tool_calling_agent.agent import _truncation_reason
 from nat.utils.io.model_processing import remove_r1_think_tags
 
 if typing.TYPE_CHECKING:
     from nat.plugins.langchain.agent.react_agent.register import ReActAgentWorkflowConfig
 
 logger = logging.getLogger(__name__)
+
+_REACT_ACTION_PATTERN = re.compile(r"action\s*\d*\s*:", re.IGNORECASE)
+_THINK_INNER_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _looks_like_react_payload(text: str) -> bool:
+    """Return True when text contains a ReAct Action or Final Answer marker."""
+    return bool(FINAL_ANSWER_PATTERN.search(text) or _REACT_ACTION_PATTERN.search(text))
+
+
+def _has_nonempty_text(content: typing.Any) -> bool:
+    """Return True when message content has non-whitespace text."""
+    return bool(content) and bool(str(content).strip())
+
+
+def _normalize_react_message_content(content: typing.Any) -> str:
+    """Flatten provider content and strip reasoning-model think tags.
+
+    When a reasoning model wraps the entire ReAct payload in ``<think>`` tags
+    with nothing after the closing tag, keep the inner text so the parser
+    still sees Thought/Action/Final Answer instead of an empty string (#1611).
+    An all-reasoning message reduces to ``""`` so the retry path runs.
+    Provider ``reasoning_content`` metadata is intentionally not used here.
+    """
+    raw_text = _extract_message_text(content)
+    cleaned = remove_r1_think_tags(raw_text)
+
+    # A lone </think> with no opening tag is a provider artifact (#1611): everything before it
+    # is unusable preamble, so keep only what follows the last one. This lives here rather than
+    # in remove_r1_think_tags because it is a ReAct quirk -- the shared helper is also used by
+    # the test_time_compute components, where discarding that text would silently blank results.
+    if "</think>" in cleaned:
+        cleaned = cleaned.rsplit("</think>", 1)[1].lstrip()
+
+    if cleaned.strip():
+        return cleaned
+
+    think_match = _THINK_INNER_PATTERN.search(raw_text)
+    if think_match:
+        inner = think_match.group(1).strip()
+        if inner and _looks_like_react_payload(inner):
+            return inner
+    return cleaned
 
 
 class ReActGraphState(BaseModel):
@@ -86,7 +132,9 @@ class ReActAgentGraph(DualNodeAgent):
                  pass_tool_call_errors_to_agent: bool = True,
                  normalize_tool_input_quotes: bool = True,
                  raise_on_parsing_failure: bool = True,
-                 use_native_tool_calling: bool = False):
+                 use_native_tool_calling: bool = False,
+                 max_tool_calls: int | None = None):
+        """Build the ReAct agent around ``prompt | llm`` with tools bound to it."""
         super().__init__(llm=llm,
                          tools=tools,
                          callbacks=callbacks,
@@ -99,6 +147,7 @@ class ReActAgentGraph(DualNodeAgent):
         self.normalize_tool_input_quotes = normalize_tool_input_quotes
         self.raise_on_parsing_failure = raise_on_parsing_failure
         self.use_native_tool_calling = use_native_tool_calling
+        self.max_tool_calls = max_tool_calls
         logger.debug(
             "%s Filling the prompt variables 'tools' and 'tool_names', using the tools provided in the config.",
             AGENT_LOG_PREFIX)
@@ -199,6 +248,7 @@ class ReActAgentGraph(DualNodeAgent):
         return tool_input_str, False
 
     async def agent_node(self, state: ReActGraphState, config: RunnableConfig | None = None):
+        """Run one ReAct step and append the reply or ``AgentAction`` to the state."""
         try:
             logger.debug("%s Starting the ReAct Agent Node", AGENT_LOG_PREFIX)
             # keeping a working state allows us to resolve parsing errors without polluting the agent scratchpad
@@ -224,7 +274,7 @@ class ReActAgentGraph(DualNodeAgent):
                     output_message = await self._stream_llm(self.agent, inputs, config=config)  # type: ignore
                     # Normalize content to text up front: providers such as Anthropic / AWS Bedrock
                     # return list-style content blocks that the parsing and retry logic below cannot handle.
-                    output_message.content = remove_r1_think_tags(_extract_message_text(output_message.content))
+                    output_message.content = _normalize_react_message_content(output_message.content)
                     agent_thoughts = _format_agent_thoughts_for_log(output_message)
 
                     if self.detailed_logs:
@@ -235,9 +285,14 @@ class ReActAgentGraph(DualNodeAgent):
                     # and give the agent the response from the tool it called
                     agent_scratchpad = []
                     for index, intermediate_step in enumerate(state.agent_scratchpad):
-                        agent_thoughts = AIMessage(content=intermediate_step.log)
+                        # Replay only non-empty thoughts so later cycles cannot 400 the LLM (#1611)
+                        log_content = intermediate_step.log if _has_nonempty_text(
+                            intermediate_step.log) else "Thought: continue"
+                        agent_thoughts = AIMessage(content=log_content)
                         agent_scratchpad.append(agent_thoughts)
                         tool_response_content = str(state.tool_responses[index].content)
+                        if not _has_nonempty_text(tool_response_content):
+                            tool_response_content = "The tool returned an empty response."
                         tool_response = HumanMessage(content=tool_response_content)
                         agent_scratchpad.append(tool_response)
                     agent_scratchpad += working_state
@@ -249,7 +304,7 @@ class ReActAgentGraph(DualNodeAgent):
                     output_message = await self._stream_llm(self.agent, inputs, config=config)  # type: ignore
                     # Normalize content to text up front: providers such as Anthropic / AWS Bedrock
                     # return list-style content blocks that the parsing and retry logic below cannot handle.
-                    output_message.content = remove_r1_think_tags(_extract_message_text(output_message.content))
+                    output_message.content = _normalize_react_message_content(output_message.content)
                     agent_thoughts = _format_agent_thoughts_for_log(output_message)
 
                     if self.detailed_logs:
@@ -257,6 +312,12 @@ class ReActAgentGraph(DualNodeAgent):
                         logger.debug("%s The agent's scratchpad (with tool result) was:\n%s",
                                      AGENT_LOG_PREFIX,
                                      agent_scratchpad)
+                # A truncated reply would be parsed as a complete answer or tool input (#2518), and a cut-off
+                # native tool call would run with partially parsed arguments
+                truncation: str | None = _truncation_reason(output_message)
+                if truncation is not None:
+                    raise RuntimeError(f"LLM output truncated ({truncation}). "
+                                       f"Truncated output: {str(output_message.content)[:500]!r}")
                 try:
                     # check if the agent has the final answer yet
                     logger.debug("%s Successfully obtained agent response. Parsing agent's response", AGENT_LOG_PREFIX)
@@ -337,12 +398,15 @@ class ReActAgentGraph(DualNodeAgent):
                         combined_content = str(ex.observation) + '\n' + str(output_message.content)
                         output_message.content = combined_content
                         state.messages += [output_message]
+                        # mark the run as finished, so the conditional edge ends it instead of
+                        # re-running the previous tool call from the scratchpad
+                        state.final_answer = combined_content
                         return state
                     # retry parsing errors, if configured
                     logger.info("%s Retrying ReAct Agent, including output parsing Observation", AGENT_LOG_PREFIX)
                     # Only append non-empty messages to prevent LLM 400 errors
                     # when empty content is forwarded via agent_scratchpad (#1611)
-                    if output_message.content and str(output_message.content).strip():
+                    if _has_nonempty_text(output_message.content):
                         working_state.append(output_message)
                         working_state.append(HumanMessage(content=str(ex.observation)))
                     else:
@@ -363,12 +427,17 @@ class ReActAgentGraph(DualNodeAgent):
                 logger.debug("%s Final answer:\n%s", AGENT_LOG_PREFIX, state.final_answer)
                 return AgentDecision.END
             # else the agent wants to call a tool
+            if self.max_tool_calls is not None and len(state.tool_responses) >= self.max_tool_calls:
+                raise GraphRecursionError(f"ReAct Agent reached max_tool_calls ({self.max_tool_calls}) "
+                                          "without a final answer")
             agent_output = state.agent_scratchpad[-1]
             logger.debug("%s The agent wants to call: %s with input: %s",
                          AGENT_LOG_PREFIX,
                          agent_output.tool,
                          agent_output.tool_input)
             return AgentDecision.TOOL
+        except GraphRecursionError:
+            raise
         except Exception as ex:
             logger.exception("Failed to determine whether agent is calling a tool: %s", ex)
             logger.warning("%s Ending graph traversal", AGENT_LOG_PREFIX)

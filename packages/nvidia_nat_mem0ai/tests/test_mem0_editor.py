@@ -19,6 +19,7 @@ import pytest
 
 from nat.memory.models import MemoryItem
 from nat.plugins.mem0ai.mem0_editor import Mem0Editor
+from nat.utils.exception_handlers.automatic_retries import patch_with_retry
 
 
 @pytest.fixture(name="mock_mem0_client")
@@ -67,6 +68,36 @@ async def test_add_items_success(mem0_editor: Mem0Editor, mock_mem0_client: Asyn
                                          tags=sample_memory_item.tags,
                                          metadata=sample_memory_item.metadata,
                                          output_format="v1.1")
+
+
+@pytest.fixture(name="run_scoped_memory_item")
+def run_scoped_memory_item_fixture(sample_memory_item: MemoryItem) -> MemoryItem:
+    """Fixture to provide a MemoryItem whose metadata carries a Mem0 run ID."""
+    return sample_memory_item.model_copy(update={"metadata": {"run_id": "run-1", "key1": "value1"}})
+
+
+async def test_add_items_keeps_run_id_in_item_metadata(mem0_editor: Mem0Editor,
+                                                       mock_mem0_client: AsyncMock,
+                                                       run_scoped_memory_item: MemoryItem):
+    """Every add receives the run ID, and the caller's item metadata is left unchanged."""
+    await mem0_editor.add_items([run_scoped_memory_item, run_scoped_memory_item])
+
+    assert run_scoped_memory_item.metadata == {"run_id": "run-1", "key1": "value1"}
+    assert mock_mem0_client.add.call_count == 2
+    for call in mock_mem0_client.add.call_args_list:
+        assert call.kwargs["run_id"] == "run-1"
+        assert call.kwargs["metadata"] == {"key1": "value1"}
+
+
+async def test_add_items_retry_keeps_run_id(mock_mem0_client: AsyncMock, run_scoped_memory_item: MemoryItem):
+    """A retried add (as configured by ``do_auto_retry``) still sends the run ID."""
+    mock_mem0_client.add.side_effect = [RuntimeError("503 Service Unavailable"), None]
+    editor = patch_with_retry(Mem0Editor(mem0_client=mock_mem0_client), retries=2, base_delay=0)
+
+    await editor.add_items([run_scoped_memory_item])
+
+    assert mock_mem0_client.add.call_count == 2
+    assert [call.kwargs["run_id"] for call in mock_mem0_client.add.call_args_list] == ["run-1", "run-1"]
 
 
 async def test_add_items_empty_list(mem0_editor: Mem0Editor, mock_mem0_client: AsyncMock):
@@ -127,3 +158,116 @@ async def test_remove_items_missing_arguments(mem0_editor: Mem0Editor):
     result = await mem0_editor.remove_items()
 
     assert result is None
+
+
+async def test_search_uses_real_mem0_v2_filter_contract(monkeypatch):
+    import json
+
+    import httpx
+    from mem0 import AsyncMemoryClient
+    from mem0.client import main
+
+    def validate(client):
+        client.org_id = "org1"
+        client.project_id = "project1"
+        return "test@example.com"
+
+    monkeypatch.setattr(AsyncMemoryClient, "_validate_api_key", validate)
+    monkeypatch.setattr(main, "capture_client_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_maybe_alias_anon_to_email", lambda *args: None)
+    monkeypatch.setattr(main, "get_user_id", lambda: "test")
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={"results": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http_client:
+        client = AsyncMemoryClient(api_key="test", client=http_client)
+        editor = Mem0Editor(client)
+        extra_filters = {"categories": {"contains": "vegetarian"}}
+        assert await editor.search("food", user_id="user123", run_id="run1", filters=extra_filters) == []
+
+    payload = json.loads(requests[0].content)
+    assert requests[0].url.path == "/v3/memories/search/"
+    assert payload["filters"] == {"AND": [{"user_id": "user123", "run_id": "run1"}, extra_filters]}
+    assert "user_id" not in payload
+    assert extra_filters == {"categories": {"contains": "vegetarian"}}
+
+
+@pytest.mark.parametrize("requested_org, raises", [("org1", False), ("other-org", True)])
+async def test_memory_factory_uses_api_key_membership(monkeypatch, requested_org, raises):
+    from unittest.mock import MagicMock
+
+    from mem0 import AsyncMemoryClient
+    from mem0.client import main
+
+    from nat.plugins.mem0ai.memory import Mem0MemoryClientConfig
+    from nat.plugins.mem0ai.memory import mem0_memory_client
+
+    clients = []
+
+    def validate(client):
+        client.org_id = "org1"
+        client.project_id = "project1"
+        clients.append(client)
+        return "test@example.com"
+
+    monkeypatch.setenv("MEM0_API_KEY", "test")
+    monkeypatch.setattr(AsyncMemoryClient, "_validate_api_key", validate)
+    monkeypatch.setattr(main, "capture_client_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_maybe_alias_anon_to_email", lambda *args: None)
+    monkeypatch.setattr(main, "get_user_id", lambda: "test")
+    config = Mem0MemoryClientConfig(org_id=requested_org, project_id="project1", do_auto_retry=False)
+    if raises:
+        with pytest.raises(ValueError, match="membership"):
+            async with mem0_memory_client(config, MagicMock()):
+                pytest.fail("Mismatched tenant must not yield a memory editor")
+    else:
+        async with mem0_memory_client(config, MagicMock()) as editor:
+            assert isinstance(editor, Mem0Editor)
+    assert clients[0].async_client.is_closed
+
+
+@pytest.mark.parametrize("scope",
+                         [
+                             {
+                                 "agent_id": "agent1"
+                             },
+                             {
+                                 "filters": {
+                                     "agent_id": "agent1"
+                                 }
+                             },
+                             {
+                                 "filters": {
+                                     "OR": [{
+                                         "agent_id": "agent1"
+                                     }, {
+                                         "user_id": "user123"
+                                     }]
+                                 }
+                             },
+                             {
+                                 "filters": {
+                                     "AND": [{
+                                         "NOT": {
+                                             "agent_id": "agent1"
+                                         }
+                                     }]
+                                 }
+                             },
+                         ])
+async def test_search_rejects_separate_agent_scope(mem0_editor, mock_mem0_client, scope):
+    with pytest.raises(ValueError, match="separate entity scope"):
+        await mem0_editor.search("query", user_id="user123", **scope)
+    mock_mem0_client.search.assert_not_called()
+
+
+async def test_search_agent_metadata_retains_user_scope(mem0_editor, mock_mem0_client):
+    mock_mem0_client.search.return_value = {"results": []}
+    metadata_filter = {"metadata": {"agent_id": "agent1"}}
+    await mem0_editor.search("query", user_id="user123", filters=metadata_filter)
+    sent_filters = mock_mem0_client.search.call_args.kwargs["filters"]
+    assert sent_filters == {"AND": [{"user_id": "user123"}, metadata_filter]}
+    assert metadata_filter == {"metadata": {"agent_id": "agent1"}}

@@ -63,6 +63,35 @@ class TestSearchSpaceSuggest:
         assert result == 0.4
         trial.suggest_float.assert_called_once_with("float_param", 0.1, 1.0, log=False, step=0.1)
 
+    def test_integer_range_without_step_uses_step_one(self):
+        space = SearchSpace(low=128, high=1024)
+        trial = mock.MagicMock()
+        trial.suggest_int.return_value = 256
+
+        result = space.suggest(trial, name="max_tokens")
+
+        assert result == 256
+        trial.suggest_int.assert_called_once_with("max_tokens", 128, 1024, log=False, step=1)
+
+    def test_integer_range_with_float_integral_step_passes_int_step(self):
+        space = SearchSpace(low=1, high=20, step=5.0)
+        trial = mock.MagicMock()
+
+        space.suggest(trial, name="int_param")
+
+        trial.suggest_int.assert_called_once_with("int_param", 1, 20, log=False, step=5)
+        assert isinstance(trial.suggest_int.call_args.kwargs["step"], int)
+
+    @pytest.mark.parametrize("low, high, step", [(0, 0.6, 0.2), (1, 10, 0.5)])
+    def test_integer_low_with_non_integral_range_uses_float(self, low, high, step):
+        space = SearchSpace(low=low, high=high, step=step)
+        trial = mock.MagicMock()
+
+        space.suggest(trial, name="float_param")
+
+        trial.suggest_int.assert_not_called()
+        trial.suggest_float.assert_called_once_with("float_param", float(low), float(high), log=False, step=step)
+
     def test_suggest_type_hints_resolve_without_optuna(self):
         hints = typing.get_type_hints(SearchSpace.suggest)
 
@@ -229,11 +258,6 @@ class TestSearchSpaceToGridValues:
         with pytest.raises(ValueError, match="Log scale is not yet supported for grid search"):
             space.to_grid_values()
 
-    def test_missing_low_high_raises_error(self):
-        space = SearchSpace(low=None, high=None)
-        with pytest.raises(ValueError, match="requires either 'values' or both 'low' and 'high'"):
-            space.to_grid_values()
-
     def test_categorical_values_returned_as_list(self):
         space = SearchSpace(values=["small", "medium", "large"])
         result = space.to_grid_values()
@@ -309,6 +333,11 @@ class TestSearchSpaceValidation:
         """Test that empty values list raises validation error."""
         with pytest.raises(ValueError, match="'values' must not be empty"):
             SearchSpace(values=[])
+
+    def test_missing_values_and_range_raises_error(self):
+        """Test that a search space must define values or a range."""
+        with pytest.raises(ValueError, match="requires either 'values' or both 'low' and 'high'"):
+            SearchSpace()
 
     def test_low_equals_high_raises_error(self):
         """Test that low == high raises validation error."""

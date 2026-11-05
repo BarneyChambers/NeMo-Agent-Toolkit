@@ -86,6 +86,8 @@ class SearchSpace(BaseModel, Generic[T]):
         # 3. Range-based validation
         if (self.low is None) != (self.high is None):  # XOR using !=
             raise ValueError(f"SearchSpace range requires both 'low' and 'high'; got low={self.low}, high={self.high}")
+        if self.low is None and self.high is None:
+            raise ValueError("SearchSpace requires either 'values' or both 'low' and 'high' to be defined")
         if self.low is not None and self.high is not None and self.low >= self.high:
             raise ValueError(f"SearchSpace 'low' must be less than 'high'; got low={self.low}, high={self.high}")
 
@@ -98,8 +100,11 @@ class SearchSpace(BaseModel, Generic[T]):
                              "Use the genetic algorithm implementation instead.")
         if self.values is not None:
             return trial.suggest_categorical(name, self.values)
-        if isinstance(self.low, int):
-            return trial.suggest_int(name, self.low, cast(int, self.high), log=self.log, step=self.step)
+        # Use an integer range only if low, high, and step (when given) are all integral
+        if (isinstance(self.low, int) and isinstance(self.high, int)
+                and (self.step is None or float(self.step).is_integer())):
+            step = int(self.step) if self.step is not None else 1
+            return trial.suggest_int(name, self.low, self.high, log=self.log, step=step)
         return trial.suggest_float(name, cast(float, self.low), cast(float, self.high), log=self.log, step=self.step)
 
     def to_grid_values(self) -> list[Any]:

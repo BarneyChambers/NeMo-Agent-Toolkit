@@ -129,9 +129,10 @@ def _patch_llm_based_on_config(client: ModelType, llm_config: "LLMBaseConfig") -
     if model_field is not None:
         client = client.configurable_fields(**{model_field: ConfigurableField(id="model_name")})
 
-    if isinstance(llm_config, RetryMixin):
+    if isinstance(llm_config, RetryMixin) and llm_config.do_auto_retry:
         client = patch_with_retry(client,
                                   retries=llm_config.num_retries,
+                                  max_wait=llm_config.retry_max_wait,
                                   retry_codes=llm_config.retry_on_status_codes,
                                   retry_on_messages=llm_config.retry_on_errors)
 
@@ -158,12 +159,17 @@ async def aws_bedrock_langchain(llm_config: AWSBedrockModelConfig, _builder: Bui
 
     validate_no_responses_api(llm_config, LLMFrameworkEnum.LANGCHAIN)
 
-    client = ChatBedrockConverse(**llm_config.model_dump(
-        exclude={"type", "context_size", "thinking", "api_type"},
+    config_dict = llm_config.model_dump(
+        exclude={"type", "context_size", "thinking", "api_type", "region_name"},
         by_alias=True,
         exclude_none=True,
         exclude_unset=True,
-    ))
+    )
+    # The "None" string default means no region, so boto3 falls back to the AWS configuration.
+    if llm_config.region_name not in (None, "None"):
+        config_dict["region_name"] = llm_config.region_name
+
+    client = ChatBedrockConverse(**config_dict)
 
     yield _patch_llm_based_on_config(client, llm_config)
 
@@ -335,7 +341,7 @@ async def dynamo_langchain(llm_config: DynamoModelConfig, _builder: Builder):
 
     # Build config dict excluding Dynamo-specific and NAT-specific fields
     config_dict = llm_config.model_dump(
-        exclude={"type", "thinking", "api_type", *DynamoModelConfig.get_dynamo_field_names()},
+        exclude={"type", "thinking", "api_type", "verify_ssl", *DynamoModelConfig.get_dynamo_field_names()},
         by_alias=True,
         exclude_none=True,
         exclude_unset=True,

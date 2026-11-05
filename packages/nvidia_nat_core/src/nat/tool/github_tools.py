@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from datetime import datetime
 from typing import Literal
+from urllib.parse import quote
 
 from pydantic import BaseModel
 from pydantic import Field
@@ -29,6 +31,60 @@ from nat.cli.register_workflow import register_function
 from nat.cli.register_workflow import register_function_group
 from nat.data_models.function import FunctionBaseConfig
 from nat.data_models.function import FunctionGroupBaseConfig
+
+
+def _validate_url_path_component(value: str, field_name: str) -> str:
+    """Validate one unencoded URL path component.
+
+    Encoding alone does not stop a URL parser from interpreting dot segments, so
+    reject path syntax before percent-encoding a value for an outbound URL.
+    """
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if value == "." or ".." in value:
+        raise ValueError(f"{field_name} must not be '.' or contain '..'")
+    if any(character in value for character in ("/", "\\", "?", "#")):
+        raise ValueError(f"{field_name} must not contain URL path syntax")
+    if any(ord(character) < 0x20 or ord(character) == 0x7f for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    return value
+
+
+def _parse_repo_name(repo_name: str) -> tuple[str, str]:
+    """Parse and validate an ``owner/repository`` GitHub repository name."""
+    parts = repo_name.split("/")
+    if len(parts) != 2:
+        raise ValueError("repo_name must be in the format 'owner/repo'")
+    return (_validate_url_path_component(parts[0], "repo_name owner"),
+            _validate_url_path_component(parts[1], "repo_name repository"))
+
+
+async def _validate_and_encode_branch(branch: str) -> str:
+    """Validate a Git branch before using it in a GitHub ref URL."""
+    # the real validation check is running `git check-ref-format --branch <branch>`, but that comes at a cost
+    # we can reject some common invalid branch names cheaper with _validate_url_path_component
+    components = branch.split("/")
+    for component in components:
+        _validate_url_path_component(component, "branch component")
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "check-ref-format",
+            "--branch",
+            branch,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("The git executable is required to validate branch names") from error
+
+    stdout, _ = await process.communicate()
+    validated_branch = stdout.decode("utf-8").removesuffix("\n")
+    if process.returncode != 0 or validated_branch != branch:
+        raise ValueError(f"Invalid Git branch name: {branch!r}")
+
+    return "/".join(quote(component, safe="") for component in components)
 
 
 class GithubCreateIssueModel(BaseModel):
@@ -50,20 +106,25 @@ class GithubGetIssueModel(BaseModel):
     mentioned: str | None = Field(default=None, description="Name of person mentioned in issue")
     labels: list[str] | None = Field(default=None, description="A list of labels that are assigned to the issue")
     since: str | None = Field(default=None,
-                              description="Only show results that were last updated after the given time.")
+                              description=("Only show results that were last updated after the given time, "
+                                           "as an ISO 8601 timestamp in the form YYYY-MM-DDTHH:MM:SSZ."))
 
-    @classmethod
     @field_validator('since', mode='before')
+    @classmethod
     def validate_since(cls, v):
-        if v is None:
+        if not isinstance(v, str):
+            # None passes, and other types get the field's own string type error.
             return v
         try:
             # Parse the string to a datetime object
             parsed_date = datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ")
-            # Return the formatted string
-            return parsed_date.isoformat() + 'Z'
         except ValueError as e:
             raise ValueError("since must be in ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ") from e
+        # strptime also accepts missing leading zeros, such as 2026-1-1T0:0:0Z, so require the exact form
+        if parsed_date.strftime("%Y-%m-%dT%H:%M:%SZ") != v:
+            raise ValueError("since must be in ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ")
+        # Return the formatted string
+        return parsed_date.isoformat() + 'Z'
 
 
 class GithubGetIssueModelList(BaseModel):
@@ -73,7 +134,7 @@ class GithubGetIssueModelList(BaseModel):
 
 
 class GithubUpdateIssueModel(BaseModel):
-    issue_number: str = Field(description="The issue number that will be updated")
+    issue_number: PositiveInt = Field(description="The issue number that will be updated")
     title: str | None = Field(default=None, description="The title of the GitHub Issue")
     body: str | None = Field(default=None, description="The body of the GitHub Issue")
     state: Literal["open", "closed"] | None = Field(default=None, description="The new state of the issue")
@@ -163,6 +224,9 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
 
     import httpx
 
+    owner, repository = _parse_repo_name(config.repo_name)
+    repository_url = f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+
     token: str | None = None
     for env_var in ["GITHUB_TOKEN", "GITHUB_PAT", "GH_TOKEN"]:
         token = os.getenv(env_var)
@@ -183,7 +247,7 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
 
         # Issues
         async def create_issue(issues_list: GithubCreateIssueModelList) -> str:
-            url = f"https://api.github.com/repos/{config.repo_name}/issues"
+            url = f"{repository_url}/issues"
             results = []
             for issue in issues_list.issues:
                 payload = issue.model_dump(exclude_unset=True)
@@ -193,17 +257,21 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
             return json.dumps(results)
 
         async def get_issue(issues_list: GithubGetIssueModelList) -> str:
-            url = f"https://api.github.com/repos/{config.repo_name}/issues"
+            url = f"{repository_url}/issues"
             results = []
             for issue in issues_list.filter_parameters:
                 params = issue.model_dump(exclude_unset=True, exclude_none=True)
+                # GitHub reads `labels` as one comma-separated value. Passing the list would repeat the query
+                # parameter, and GitHub would then filter by the last label only.
+                if "labels" in params:
+                    params["labels"] = ",".join(params["labels"])
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 results.append(response.json())
             return json.dumps(results)
 
         async def update_issue(issues_list: GithubUpdateIssueModelList) -> str:
-            url = f"https://api.github.com/repos/{config.repo_name}/issues"
+            url = f"{repository_url}/issues"
             results = []
             for issue in issues_list.issues:
                 payload = issue.model_dump(exclude_unset=True, exclude_none=True)
@@ -217,7 +285,7 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
         # Pull requests
         async def create_pull(pull_list: GithubCreatePullList) -> str:
             results = []
-            pr_url = f"https://api.github.com/repos/{config.repo_name}/pulls"
+            pr_url = f"{repository_url}/pulls"
 
             for pull_detail in pull_list.pull_details:
 
@@ -232,14 +300,14 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
                 result = {"pull_request": pr_response.json()}
 
                 if pull_detail.assignees:
-                    assignees_url = f"https://api.github.com/repos/{config.repo_name}/issues/{pr_number}/assignees"
+                    assignees_url = f"{repository_url}/issues/{pr_number}/assignees"
                     assignees_data = {"assignees": pull_detail.assignees}
                     assignees_response = await client.post(assignees_url, json=assignees_data)
                     assignees_response.raise_for_status()
                     result["assignees"] = assignees_response.json()
 
                 if pull_detail.reviewers:
-                    reviewers_url = f"https://api.github.com/repos/{config.repo_name}/pulls/{pr_number}/requested_reviewers"
+                    reviewers_url = f"{repository_url}/pulls/{pr_number}/requested_reviewers"
                     reviewers_data = {"reviewers": pull_detail.reviewers}
                     reviewers_response = await client.post(reviewers_url, json=reviewers_data)
                     reviewers_response.raise_for_status()
@@ -250,7 +318,7 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
             return json.dumps(results)
 
         async def get_pull(pull_list: GithubGetPullsModelList) -> str:
-            url = f"https://api.github.com/repos/{config.repo_name}/pulls"
+            url = f"{repository_url}/pulls"
             results = []
             for pull_params in pull_list.filter_parameters:
                 params = pull_params.model_dump(exclude_unset=True, exclude_none=True)
@@ -266,14 +334,18 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
                 raise ValueError("'local_repo_dir' must be set in the github function group config to use 'commit'")
 
             results = []
+            encoded_branches: dict[str, str] = {}
+            safe_root = os.path.realpath(config.local_repo_dir)
             for updated_file in updated_file_list.updated_files:
                 branch = updated_file.branch
+                if branch not in encoded_branches:
+                    encoded_branches[branch] = await _validate_and_encode_branch(branch)
+                encoded_branch = encoded_branches[branch]
                 commit_msg = updated_file.commit_msg
                 local_path = updated_file.local_path
                 remote_path = updated_file.remote_path
 
                 # Read content from the local file (secure + binary-safe)
-                safe_root = os.path.realpath(config.local_repo_dir)
                 candidate = os.path.realpath(os.path.join(config.local_repo_dir, local_path))
                 if not candidate.startswith(safe_root + os.sep):
                     raise ValueError(f"local_path '{local_path}' resolves outside local_repo_dir")
@@ -284,26 +356,26 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
                 content_b64 = base64.b64encode(content_bytes).decode("ascii")
 
                 # 1) Create blob
-                blob_url = f"https://api.github.com/repos/{config.repo_name}/git/blobs"
+                blob_url = f"{repository_url}/git/blobs"
                 blob_data = {"content": content_b64, "encoding": "base64"}
                 blob_response = await client.post(blob_url, json=blob_data)
                 blob_response.raise_for_status()
                 blob_sha = blob_response.json()["sha"]
 
                 # 2) Get current ref (parent commit SHA)
-                ref_url = f"https://api.github.com/repos/{config.repo_name}/git/refs/heads/{branch}"
+                ref_url = f"{repository_url}/git/refs/heads/{encoded_branch}"
                 ref_response = await client.get(ref_url)
                 ref_response.raise_for_status()
                 parent_commit_sha = ref_response.json()["object"]["sha"]
 
                 # 3) Get parent commit to retrieve its tree SHA
-                parent_commit_url = f"https://api.github.com/repos/{config.repo_name}/git/commits/{parent_commit_sha}"
+                parent_commit_url = f"{repository_url}/git/commits/{parent_commit_sha}"
                 parent_commit_resp = await client.get(parent_commit_url)
                 parent_commit_resp.raise_for_status()
                 base_tree_sha = parent_commit_resp.json()["tree"]["sha"]
 
                 # 4) Create tree
-                tree_url = f"https://api.github.com/repos/{config.repo_name}/git/trees"
+                tree_url = f"{repository_url}/git/trees"
                 tree_data = {
                     "base_tree": base_tree_sha,
                     "tree": [{
@@ -315,14 +387,14 @@ async def github_tool(config: GithubGroupConfig, _builder: Builder):
                 tree_sha = tree_response.json()["sha"]
 
                 # 5) Create commit
-                commit_url = f"https://api.github.com/repos/{config.repo_name}/git/commits"
+                commit_url = f"{repository_url}/git/commits"
                 commit_data = {"message": commit_msg, "tree": tree_sha, "parents": [parent_commit_sha]}
                 commit_response = await client.post(commit_url, json=commit_data)
                 commit_response.raise_for_status()
                 commit_sha = commit_response.json()["sha"]
 
                 # 6) Update ref
-                update_ref_url = f"https://api.github.com/repos/{config.repo_name}/git/refs/heads/{branch}"
+                update_ref_url = f"{repository_url}/git/refs/heads/{encoded_branch}"
                 update_ref_data = {"sha": commit_sha, "force": False}
                 update_ref_response = await client.patch(update_ref_url, json=update_ref_data)
                 update_ref_response.raise_for_status()
@@ -411,7 +483,7 @@ async def github_files_tool(config: GithubFilesGroupConfig, _builder: Builder):
             - https://github.com/org/repo/blob/main/README.md#L409-L417 -> Returns lines 409-417 of the README.md file
             """
 
-            pattern = r"https://github\.com/(?P<repo_path>[^/]*/[^/]*)/blob/(?P<file_path>[^?#]*)(?:#L(?P<start>\d+)(?:-L(?P<end>\d+))?)?"
+            pattern = r"https://github\.com/(?P<repo_path>[^/]*/[^/]*)/blob/(?P<file_path>[^?#]*)(?:\?[^#]*)?(?:#L(?P<start>\d+)(?:-L(?P<end>\d+))?)?"
             match = re.match(pattern, url_text)
             if not match:
                 return ("Invalid github url. Please provide a valid github url. "
@@ -421,8 +493,9 @@ async def github_files_tool(config: GithubFilesGroupConfig, _builder: Builder):
 
             file_metadata = FileMetadata(**match.groupdict())
 
-            # The following URL is the raw URL of the file. refs/heads/ always points to the top commit of the branch
-            raw_url = f"https://raw.githubusercontent.com/{file_metadata.repo_path}/refs/heads/{file_metadata.file_path}"
+            # The following URL is the raw URL of the file. Without a refs/heads/ prefix, raw.githubusercontent.com
+            # accepts any ref from the link, so branch, tag and commit links all work.
+            raw_url = f"https://raw.githubusercontent.com/{file_metadata.repo_path}/{file_metadata.file_path}"
             try:
                 response = await client.get(raw_url)
                 response.raise_for_status()
@@ -434,7 +507,7 @@ async def github_files_tool(config: GithubFilesGroupConfig, _builder: Builder):
 
             lines = response.text.splitlines()
 
-            if file_metadata.start_line > len(lines):
+            if file_metadata.start_line < 1 or file_metadata.start_line > len(lines):
                 return f"Error: Line {file_metadata.start_line} is out of range for the file {file_metadata.file_path}"
 
             if file_metadata.end_line is None:
@@ -442,6 +515,9 @@ async def github_files_tool(config: GithubFilesGroupConfig, _builder: Builder):
 
             if file_metadata.end_line > len(lines):
                 return f"Error: Line {file_metadata.end_line} is out of range for the file {file_metadata.file_path}"
+
+            if file_metadata.end_line < file_metadata.start_line:
+                return f"Error: Line range {file_metadata.start_line}-{file_metadata.end_line} is reversed"
 
             selected_lines = lines[file_metadata.start_line - 1:file_metadata.end_line]
             response_text = "\n".join(selected_lines)

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from dataclasses import field
 
 import click
-import httpx
+import httpx2
 import pkce
 from authlib.common.errors import AuthlibBaseError as OAuthError
 from authlib.integrations.httpx_client import AsyncOAuth2Client
@@ -48,6 +48,7 @@ class _FlowState:
     verifier: str | None = None
     token_url: str | None = None
     use_pkce: bool | None = None
+    client: AsyncOAuth2Client | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +166,7 @@ class ConsoleAuthenticationFlowHandler(FlowHandlerBase):
 
         flow_state.token_url = cfg.token_url
         flow_state.use_pkce = cfg.use_pkce
+        flow_state.client = client
 
         # PKCE bits
         if cfg.use_pkce:
@@ -232,7 +234,7 @@ class ConsoleAuthenticationFlowHandler(FlowHandlerBase):
                 return "Invalid state; restart authentication."
             flow_state = self._flows[state]
             try:
-                token = await self._oauth_client.fetch_token(  # type: ignore[arg-type]
+                token = await flow_state.client.fetch_token(  # type: ignore[union-attr]
                     url=flow_state.token_url,
                     authorization_response=str(request.url),
                     code_verifier=flow_state.verifier if flow_state.use_pkce else None,
@@ -243,7 +245,7 @@ class ConsoleAuthenticationFlowHandler(FlowHandlerBase):
                 flow_state.future.set_exception(
                     RuntimeError(f"Authorization server rejected request: {e.error} ({e.description})"))
                 return "Authentication failed: Authorization server rejected the request. You may close this tab."
-            except httpx.HTTPError as e:
+            except httpx2.HTTPError as e:
                 flow_state.future.set_exception(RuntimeError(f"Network error during token fetch: {e}"))
                 return "Authentication failed: Network error occurred. You may close this tab."
             except Exception as e:

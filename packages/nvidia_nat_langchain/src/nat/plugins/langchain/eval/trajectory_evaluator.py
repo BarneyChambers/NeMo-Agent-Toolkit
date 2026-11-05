@@ -16,11 +16,18 @@
 import asyncio
 import logging
 import re
+import warnings
 from collections.abc import Mapping
 
-from langchain_classic.evaluation import TrajectoryEvalChain
+from langchain_classic.chains import LLMChain
+from langchain_classic.evaluation.agents.trajectory_eval_chain import EVAL_CHAT_PROMPT
+from langchain_classic.evaluation.agents.trajectory_eval_chain import TOOL_FREE_EVAL_CHAT_PROMPT
+from langchain_classic.evaluation.agents.trajectory_eval_chain import TrajectoryEvalChain
+from langchain_classic.evaluation.agents.trajectory_eval_chain import TrajectoryOutputParser
 from langchain_core.agents import AgentAction
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import LanguageModelInput
+from langchain_core.messages import BaseMessage
+from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from pydantic import Field
 
@@ -230,12 +237,28 @@ def _atif_to_user_input(trajectory) -> str:
 
 class TrajectoryEvaluator(BaseEvaluator):
 
-    def __init__(self, llm: BaseChatModel, tools: list[BaseTool] | None = None, max_concurrency: int = 8):
+    def __init__(
+        self,
+        llm: Runnable[LanguageModelInput, str] | Runnable[LanguageModelInput, BaseMessage],
+        tools: list[BaseTool] | None = None,
+        max_concurrency: int = 8,
+    ):
         super().__init__(max_concurrency=max_concurrency)
-        self.traj_eval_chain = TrajectoryEvalChain.from_llm(llm=llm,
-                                                            tools=tools,
-                                                            return_reasoning=True,
-                                                            requires_reference=True)
+        prompt = EVAL_CHAT_PROMPT if tools else TOOL_FREE_EVAL_CHAT_PROMPT
+        # TrajectoryEvalChain still requires LLMChain, but constructing it outside
+        # LangChain emits a deprecation warning that its own from_llm factory suppresses.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore",
+                                    message=r"The class `LLMChain` was deprecated",
+                                    category=DeprecationWarning)
+            eval_chain = LLMChain(llm=llm, prompt=prompt)
+        self.traj_eval_chain = TrajectoryEvalChain(
+            agent_tools=tools,
+            eval_chain=eval_chain,
+            output_parser=TrajectoryOutputParser(),
+            return_reasoning=True,
+            requires_reference=True,
+        )
 
     async def _evaluate_with_trajectory(self,
                                         item_id,
@@ -333,6 +356,7 @@ async def register_trajectory_evaluator(config: TrajectoryEvaluatorConfig, build
         llm = patch_with_retry(
             llm,
             retries=config.num_retries,
+            max_wait=config.retry_max_wait,
             retry_codes=config.retry_on_status_codes,
             retry_on_messages=config.retry_on_errors,
         )

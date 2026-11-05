@@ -19,15 +19,19 @@ the initial call plus any retries. Values below 1 are normalized to 1, so a
 wrapped callable always executes at least once.
 """
 import asyncio
+import contextvars
 import copy
+import datetime
+import email.utils
 import functools
 import gc
 import inspect
 import logging
+import math
 import re
+import threading
 import time
 import types
-import weakref
 from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Sequence
@@ -38,6 +42,26 @@ T = TypeVar("T")
 Exc = tuple[type[BaseException], ...]  # exception classes
 CodePattern = int | str | range  # for retry_codes argument
 logger = logging.getLogger(__name__)
+
+# (patched object id, owning task/thread id) pairs the current call chain is already
+# retrying. A ContextVar (not an instance attribute) keeps this per-call-chain: concurrent
+# tasks/threads sharing one instance never see each other's entry, and nested calls within
+# one task do. The owner id is checked, not just inherited, because asyncio.create_task()
+# copies the current ContextVar value into the child task: without an owner check, a task
+# spawned from inside a retry-wrapped call would inherit its parent's "already retrying"
+# entry for an instance it has never itself entered, and silently skip its own retries.
+_in_retry_context: contextvars.ContextVar[frozenset[tuple[int, int]]] = contextvars.ContextVar("_in_retry_context",
+                                                                                               default=frozenset())
+
+
+def _current_owner_id() -> int:
+    """Identify the running asyncio task, or the OS thread when there is none."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return id(task) if task is not None else threading.get_ident()
+
 
 # ─────────────────────────────────────────────────────────────
 #  Memory-optimized helpers
@@ -69,21 +93,26 @@ def _clear_exception_context(exc: BaseException) -> None:
     if exc is None:
         return
 
-    # Clear the exception's traceback to break reference cycles
-    # This is the main memory optimization
-    try:
-        exc.__traceback__ = None
-    except AttributeError:
-        pass
-
-    # Also try to clear any chained exceptions
-    try:
-        if hasattr(exc, '__cause__') and exc.__cause__ is not None:
-            _clear_exception_context(exc.__cause__)
-        if hasattr(exc, '__context__') and exc.__context__ is not None:
-            _clear_exception_context(exc.__context__)
-    except AttributeError:
-        pass
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        try:
+            current.__traceback__ = None
+        except AttributeError:
+            pass
+        # Exception chains can cycle when a wrapped exception is re-raised.
+        # Keep their links intact while clearing each traceback only once.
+        try:
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        except AttributeError:
+            pass
 
 
 def _run_gc_if_needed(attempt: int, gc_frequency: int = 3) -> None:
@@ -171,11 +200,107 @@ def _want_retry(
 # ─────────────────────────────────────────────────────────────
 #  Memory-optimized decorator factory
 # ─────────────────────────────────────────────────────────────
+class _YieldTracker:
+    """Forward the generator protocol to a wrapped iterator and note whether it produced an item."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = iter(stream)
+        self.yielded = False
+
+    def __iter__(self) -> "_YieldTracker":
+        return self
+
+    def __next__(self) -> Any:
+        item = next(self._stream)
+        self.yielded = True
+        return item
+
+    def send(self, value: Any) -> Any:
+        if value is None or not hasattr(self._stream, "send"):
+            return next(self)
+        item = self._stream.send(value)
+        self.yielded = True
+        return item
+
+    def throw(self, *args: Any) -> Any:
+        item = self._stream.throw(*args)
+        self.yielded = True
+        return item
+
+    def close(self) -> None:
+        close = getattr(self._stream, "close", None)
+        if close is not None:
+            close()
+
+
+def _response_headers(exc: BaseException) -> dict[str, str] | None:
+    """The HTTP response headers an exception carries, keyed in lower case."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        # botocore ClientError (e.g. Bedrock throttling)
+        metadata = response.get("ResponseMetadata")
+        headers = metadata.get("HTTPHeaders") if isinstance(metadata, dict) else None
+    else:
+        # httpx / requests responses, as on LiteLLM and OpenAI errors
+        headers = getattr(response, "headers", None)
+    if headers is None or not hasattr(headers, "items"):
+        return None
+    try:
+        return {str(key).lower(): str(value) for key, value in headers.items()}
+    except Exception:
+        return None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """
+    The wait a provider asked for in `retry-after-ms` or `Retry-After` (seconds or an HTTP date), or None.
+    """
+    headers = _response_headers(exc)
+    if not headers:
+        return None
+    value = headers.get("retry-after-ms")
+    if value is not None:
+        try:
+            wait_ms = float(value)
+            if math.isfinite(wait_ms) and wait_ms >= 0:
+                return wait_ms / 1000
+        except ValueError:
+            pass
+        # an unusable retry-after-ms falls back to Retry-After
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        wait = float(value)
+        return wait if math.isfinite(wait) and wait >= 0 else None
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.UTC)
+    return max(0.0, (when - datetime.datetime.now(datetime.UTC)).total_seconds())
+
+
+def _wait_before_retry(exc: BaseException, delay: float, max_wait: float) -> float:
+    """Wait for the provider's Retry-After when it sent one (at most `max_wait`), else the backoff delay."""
+    try:
+        retry_after = _retry_after_seconds(exc)
+    except Exception:
+        # reading the header must never cost the retry itself
+        logger.debug("Could not read Retry-After from %s", type(exc).__name__, exc_info=True)
+        retry_after = None
+    return min(retry_after, max_wait) if retry_after is not None else delay
+
+
 def _retry_decorator(
     *,
     retries: int = 3,
     base_delay: float = 0.25,
     backoff: float = 2.0,
+    max_wait: float = 60.0,
     retry_on: Exc = (Exception, ),
     retry_codes: Sequence[CodePattern] | None = None,
     retry_on_messages: Sequence[str] | None = None,
@@ -198,9 +323,12 @@ def _retry_decorator(
         at least once.
 
     instance_context_aware:
-        If True, the decorator will check for a retry context flag on the first
-        argument (assumed to be 'self'). If the flag is set, retries are skipped
-        to prevent retry storms in nested method calls.
+        If True, the decorator tracks retry state in the module-level
+        `_in_retry_context` ContextVar, keyed by the wrapped object and its
+        owning task or thread (see `_RetryContext`), rather than a flag on the
+        first argument. Nested calls within the same call chain then skip
+        their own retries, while concurrent callers sharing the same instance
+        retry independently.
     """
 
     # ``retries`` counts total attempts. A non-positive budget would make the
@@ -217,53 +345,54 @@ def _retry_decorator(
         skip_self_in_deepcopy = instance_context_aware
 
         class _RetryContext:
-            """Context manager for instance-level retry gating."""
+            """Context manager for retry gating.
 
-            __slots__ = ("_obj_ref", "_enabled", "_active")
+            Scoped to the (object, owning task/thread) pair via the module-level
+            `_in_retry_context`, not to the patched instance alone."""
+
+            __slots__ = ("_enabled", "_key", "_token")
 
             def __init__(self, args: tuple[Any, ...]):
                 if use_context_aware and args:
-                    try:
-                        # Use weak reference to avoid keeping objects alive
-                        self._obj_ref = weakref.ref(args[0])
-                        self._enabled = True
-                    except TypeError:
-                        # Object doesn't support weak references
-                        self._obj_ref = None
-                        self._enabled = False
+                    self._key = (id(args[0]), _current_owner_id())
+                    self._enabled = True
                 else:
-                    self._obj_ref = None
+                    self._key = None
                     self._enabled = False
-                self._active = False
+                self._token = None
 
-            def __enter__(self):
-                if not self._enabled or self._obj_ref is None:
+            def __enter__(self) -> bool:
+                if not self._enabled:
                     return False
 
-                obj = self._obj_ref()
-                if obj is None:
-                    return False
+                # If already in retry context, skip retries
+                if self._key in _in_retry_context.get():
+                    return True
 
+                self._token = _in_retry_context.set(_in_retry_context.get() | {self._key})
+                return False
+
+            def __exit__(self,
+                         _exc_type: type[BaseException] | None,
+                         _exc: BaseException | None,
+                         _tb: types.TracebackType | None) -> None:
+                if self._token is None:
+                    return
                 try:
-                    # If already in retry context, skip retries
-                    if getattr(obj, "_in_retry_context", False):
-                        return True
-                    object.__setattr__(obj, "_in_retry_context", True)
-                    self._active = True
-                    return False
-                except Exception:
-                    # Cannot set attribute, disable context
-                    self._enabled = False
-                    return False
-
-            def __exit__(self, _exc_type, _exc, _tb):
-                if (self._enabled and self._active and self._obj_ref is not None):
-                    obj = self._obj_ref()
-                    if obj is not None:
-                        try:
-                            object.__setattr__(obj, "_in_retry_context", False)
-                        except Exception:
-                            pass
+                    _in_retry_context.reset(self._token)
+                except ValueError:
+                    # _agen_with_retry below scopes its context to one anext() call
+                    # and exits before yielding, so this is only still reachable via
+                    # _gen_with_retry's sync generator (or a caller closing one from a
+                    # different thread), where the token is held for the whole `with`.
+                    # Nothing to reset there is unsafe to skip: no later call on this
+                    # instance can see a token minted outside its own context.
+                    logger.debug(
+                        "Retry context for key %s was entered in a different task's "
+                        "context than the one running cleanup now; skipping the "
+                        "ContextVar reset.",
+                        self._key,
+                    )
 
         async def _call_with_retry_async(*args, **kw) -> T:
             with _RetryContext(args) as already_in_context:
@@ -296,50 +425,72 @@ def _retry_decorator(
                                            msg_substrings=retry_on_messages) or attempt == total_attempts - 1:
                             raise
 
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(_wait_before_retry(exc, delay, max_wait))
                         delay *= backoff
 
                 if last_exception:
                     raise last_exception
 
         async def _agen_with_retry(*args, **kw):
-            with _RetryContext(args) as already_in_context:
-                if already_in_context:
-                    async for item in fn(*args, **kw):
-                        yield item
-                    return
+            delay = base_delay
+            last_exception = None
 
-                delay = base_delay
-                last_exception = None
-
-                for attempt in range(total_attempts):
-                    if use_shallow_copy:
+            for attempt in range(total_attempts):
+                with _RetryContext(args) as already_in_context:
+                    if already_in_context:
+                        call_args, call_kwargs = args, kw
+                    elif use_shallow_copy:
                         call_args, call_kwargs = _shallow_copy_args(args, kw)
                     else:
                         call_args, call_kwargs = _deep_copy_args(args, kw, skip_first=skip_self_in_deepcopy)
 
-                    try:
-                        async for item in fn(*call_args, **call_kwargs):
-                            yield item
-                        return
-                    except retry_on as exc:
-                        last_exception = exc
+                # The context above is entered and exited around each item advance
+                # below, never held open across a `yield`. A caller can suspend
+                # indefinitely between items, or close/GC the generator from a
+                # different task, without leaving a stale entry in this task's
+                # context that would silently skip retries on its next call.
+                try:
+                    yielded = False
+                    stream = fn(*call_args, **call_kwargs)
+                    while True:
+                        with _RetryContext(args) as already_in_context:
+                            try:
+                                item = await anext(stream)
+                            except StopAsyncIteration:
+                                break
+                        yielded = True
+                        yield item
+                except retry_on as exc:
+                    if already_in_context:
+                        raise
 
-                        # Memory cleanup
-                        if clear_tracebacks:
-                            _clear_exception_context(exc)
+                    # Clear the previous attempt's traceback (breaks reference
+                    # cycles) but keep the current exception intact so a later
+                    # ``raise last_exception`` in the ``else`` branch preserves
+                    # its traceback (#2223).
+                    if clear_tracebacks and last_exception is not None:
+                        _clear_exception_context(last_exception)
+                    last_exception = exc
 
-                        _run_gc_if_needed(attempt, gc_frequency)
+                    _run_gc_if_needed(attempt, gc_frequency)
 
-                        if not _want_retry(exc, code_patterns=retry_codes,
-                                           msg_substrings=retry_on_messages) or attempt == total_attempts - 1:
-                            raise
+                    if not _want_retry(exc, code_patterns=retry_codes,
+                                       msg_substrings=retry_on_messages) or attempt == total_attempts - 1:
+                        raise
 
-                        await asyncio.sleep(delay)
-                        delay *= backoff
+                    await asyncio.sleep(_wait_before_retry(exc, delay, max_wait))
+                    delay *= backoff
+                else:
+                    # A completed attempt that produced no chunks after a prior
+                    # failure usually means a one-shot async iterator was already
+                    # exhausted on retry (common in LangChain streaming). Re-raise
+                    # outside the except so we do not burn remaining attempts.
+                    if last_exception is not None and not yielded:
+                        raise last_exception
+                    return
 
-                if last_exception:
-                    raise last_exception
+            if last_exception:
+                raise last_exception
 
         def _gen_with_retry(*args, **kw) -> Iterable[Any]:
             with _RetryContext(args) as already_in_context:
@@ -356,15 +507,17 @@ def _retry_decorator(
                     else:
                         call_args, call_kwargs = _deep_copy_args(args, kw, skip_first=skip_self_in_deepcopy)
 
+                    tracker = _YieldTracker(fn(*call_args, **call_kwargs))
                     try:
-                        yield from fn(*call_args, **call_kwargs)
-                        return
+                        # ``yield from`` keeps send()/throw()/close() reaching the wrapped generator.
+                        yield from tracker
                     except retry_on as exc:
+                        # Same traceback-preservation as the async-generator path:
+                        # only clear the superseded ``last_exception`` so the fresh
+                        # ``exc`` keeps its traceback for any later re-raise (#2223).
+                        if clear_tracebacks and last_exception is not None:
+                            _clear_exception_context(last_exception)
                         last_exception = exc
-
-                        # Memory cleanup
-                        if clear_tracebacks:
-                            _clear_exception_context(exc)
 
                         _run_gc_if_needed(attempt, gc_frequency)
 
@@ -372,8 +525,14 @@ def _retry_decorator(
                                            msg_substrings=retry_on_messages) or attempt == total_attempts - 1:
                             raise
 
-                        time.sleep(delay)
+                        time.sleep(_wait_before_retry(exc, delay, max_wait))
                         delay *= backoff
+                    else:
+                        # Same empty-retry guard as the async-generator path: do not
+                        # treat a zero-item completion after a prior failure as success.
+                        if last_exception is not None and not tracker.yielded:
+                            raise last_exception
+                        return
 
                 if last_exception:
                     raise last_exception
@@ -407,7 +566,7 @@ def _retry_decorator(
                                            msg_substrings=retry_on_messages) or attempt == total_attempts - 1:
                             raise
 
-                        time.sleep(delay)
+                        time.sleep(_wait_before_retry(exc, delay, max_wait))
                         delay *= backoff
 
                 if last_exception:
@@ -428,12 +587,27 @@ def _retry_decorator(
     return decorate
 
 
+def _method_to_wrap(obj: Any, cls: type, name: str, descriptor: Any) -> Any:
+    """
+    The function to wrap for `name`: the one already patched onto this instance, if any, else the class's.
+
+    Patching an instance twice (for example with retries and then with a thinking prompt) must keep both, so
+    the second patch wraps the first instead of the original class method.
+    """
+    if not inspect.isclass(obj):
+        current = getattr(obj, "__dict__", {}).get(name)
+        if isinstance(current, types.MethodType) and current.__self__ is obj:
+            return current.__func__
+    return descriptor.__func__ if isinstance(descriptor, types.MethodType) else descriptor
+
+
 def patch_with_retry(
     obj: Any,
     *,
     retries: int = 3,
     base_delay: float = 0.25,
     backoff: float = 2.0,
+    max_wait: float = 60.0,
     retry_on: Exc = (Exception, ),
     retry_codes: Sequence[CodePattern] | None = None,
     retry_on_messages: Sequence[str] | None = None,
@@ -459,6 +633,15 @@ def patch_with_retry(
     deepcopy:
         If True, each retry receives deep‑copied *args and **kwargs* to avoid
         mutating shared state between attempts.
+
+    Streaming caveat
+    ----------------
+    For generator and async generator methods, a retry that finishes without
+    yielding anything after an earlier failure re-raises that earlier exception.
+    This catches the common case of a one-shot input iterator that was already
+    consumed by the failed attempt, but it also means a stream that fails (e.g.
+    with a 429) and then legitimately succeeds with zero chunks raises the
+    original error instead of returning an empty result.
     """
 
     # Invert deep copy to keep function signature the same
@@ -468,6 +651,7 @@ def patch_with_retry(
         retries=retries,
         base_delay=base_delay,
         backoff=backoff,
+        max_wait=max_wait,
         retry_on=retry_on,
         retry_codes=retry_codes,
         retry_on_messages=retry_on_messages,
@@ -488,7 +672,7 @@ def patch_with_retry(
         if name.startswith("_") or isinstance(descriptor, property | staticmethod | classmethod):
             continue
 
-        original = descriptor.__func__ if isinstance(descriptor, types.MethodType) else descriptor
+        original = _method_to_wrap(obj, cls, name, descriptor)
         wrapped = deco(original)
 
         try:  # instance‑level first

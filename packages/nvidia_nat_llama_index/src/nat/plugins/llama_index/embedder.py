@@ -39,9 +39,10 @@ async def azure_openai_llama_index(embedder_config: AzureOpenAIEmbedderModelConf
             **http_clients_dict,
         )
 
-        if isinstance(embedder_config, RetryMixin):
+        if isinstance(embedder_config, RetryMixin) and embedder_config.do_auto_retry:
             client = patch_with_retry(client,
                                       retries=embedder_config.num_retries,
+                                      max_wait=embedder_config.retry_max_wait,
                                       retry_codes=embedder_config.retry_on_status_codes,
                                       retry_on_messages=embedder_config.retry_on_errors)
 
@@ -65,9 +66,10 @@ async def nim_llama_index(embedder_config: NIMEmbedderModelConfig, _builder: Bui
         model=embedder_config.model_name,
     )
 
-    if isinstance(embedder_config, RetryMixin):
+    if isinstance(embedder_config, RetryMixin) and embedder_config.do_auto_retry:
         client = patch_with_retry(client,
                                   retries=embedder_config.num_retries,
+                                  max_wait=embedder_config.retry_max_wait,
                                   retry_codes=embedder_config.retry_on_status_codes,
                                   retry_on_messages=embedder_config.retry_on_errors)
 
@@ -88,9 +90,10 @@ async def openai_llama_index(embedder_config: OpenAIEmbedderModelConfig, _builde
             **http_clients_dict,
         )
 
-        if isinstance(embedder_config, RetryMixin):
+        if isinstance(embedder_config, RetryMixin) and embedder_config.do_auto_retry:
             client = patch_with_retry(client,
                                       retries=embedder_config.num_retries,
+                                      max_wait=embedder_config.retry_max_wait,
                                       retry_codes=embedder_config.retry_on_status_codes,
                                       retry_on_messages=embedder_config.retry_on_errors)
 

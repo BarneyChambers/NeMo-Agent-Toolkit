@@ -30,6 +30,7 @@ the next callable.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from collections.abc import Sequence
 from typing import Any
@@ -40,6 +41,9 @@ from nat.middleware.middleware import FunctionMiddlewareContext
 from nat.middleware.middleware import InvocationAction
 from nat.middleware.middleware import InvocationContext
 from nat.middleware.middleware import Middleware
+from nat.middleware.telemetry import trace_middleware
+
+logger = logging.getLogger(__name__)
 
 
 class FunctionMiddleware(Middleware):
@@ -138,8 +142,14 @@ class FunctionMiddleware(Middleware):
                                 context: FunctionMiddlewareContext,
                                 **kwargs: Any) -> AsyncIterator[Any]:
         """Delegate to function_middleware_stream for function-specific handling."""
-        async for chunk in self.function_middleware_stream(*args, call_next=call_next, context=context, **kwargs):
-            yield chunk
+        stream = self.function_middleware_stream(*args, call_next=call_next, context=context, **kwargs)
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
 
     # ==================== Orchestration ====================
 
@@ -257,18 +267,24 @@ class FunctionMiddleware(Middleware):
             return
 
         # Stream with per-chunk post-invoke
-        async for chunk in call_next(*ctx.modified_args, **ctx.modified_kwargs):
-            # Set output for this chunk
-            ctx.output = chunk
+        stream = call_next(*ctx.modified_args, **ctx.modified_kwargs)
+        try:
+            async for chunk in stream:
+                # Set output for this chunk
+                ctx.output = chunk
 
-            # Post-invoke transformation per chunk
-            result = await self.post_invoke(ctx)
-            if result is not None:
-                ctx = result
+                # Post-invoke transformation per chunk
+                result = await self.post_invoke(ctx)
+                if result is not None:
+                    ctx = result
 
-            # None output is the suppression sentinel: post_invoke cleared it to suppress this chunk.
-            if ctx.output is not None:
-                yield ctx.output
+                # None output is the suppression sentinel: post_invoke cleared it to suppress this chunk.
+                if ctx.output is not None:
+                    yield ctx.output
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
 
 
 class FunctionMiddlewareChain:
@@ -322,7 +338,17 @@ class FunctionMiddlewareChain:
                               _call_next: CallNext = call_next,
                               _context: FunctionMiddlewareContext = self._context,
                               **kwargs: Any) -> Any:
-                return await _middleware.middleware_invoke(*args, call_next=_call_next, context=_context, **kwargs)
+                """Trace one middleware invocation and return its delegated output."""
+                with trace_middleware(type(_middleware).__name__,
+                                      input_data={
+                                          "args": args, "kwargs": kwargs
+                                      },
+                                      function_name=_context.name) as trace:
+                    trace.output = await _middleware.middleware_invoke(*args,
+                                                                       call_next=_call_next,
+                                                                       context=_context,
+                                                                       **kwargs)
+                    return trace.output
 
             call = wrapped  # type: ignore[assignment]
 
@@ -352,9 +378,21 @@ class FunctionMiddlewareChain:
                               _call_next: CallNextStream = call_next,
                               _context: FunctionMiddlewareContext = self._context,
                               **kwargs: Any) -> AsyncIterator[Any]:
-                stream = _middleware.middleware_stream(*args, call_next=_call_next, context=_context, **kwargs)
-                async for chunk in stream:
-                    yield chunk
+                """Trace streamed middleware output and close its delegated iterator on exit."""
+                with trace_middleware(type(_middleware).__name__,
+                                      input_data={
+                                          "args": args, "kwargs": kwargs
+                                      },
+                                      function_name=_context.name) as trace:
+                    stream = _middleware.middleware_stream(*args, call_next=_call_next, context=_context, **kwargs)
+                    try:
+                        async for chunk in stream:
+                            trace.output = chunk
+                            yield chunk
+                    finally:
+                        close = getattr(stream, "aclose", None)
+                        if close is not None:
+                            await close()
 
             call = wrapped  # type: ignore[assignment]
 
@@ -362,7 +400,12 @@ class FunctionMiddlewareChain:
 
 
 def validate_middleware(middleware: Sequence[Middleware] | None) -> tuple[Middleware, ...]:
-    """Validate a sequence of middleware, enforcing ordering guarantees."""
+    """Validate a sequence of middleware, enforcing ordering guarantees.
+
+    Repeated instances of the same middleware are dropped (the first occurrence keeps its
+    position so that an explicitly configured middleware wins over a later auto-registered
+    one), since the same instance must not execute more than once per invocation.
+    """
 
     if not middleware:
         return tuple()
@@ -371,17 +414,28 @@ def validate_middleware(middleware: Sequence[Middleware] | None) -> tuple[Middle
         if not isinstance(mw, Middleware):
             raise TypeError("All middleware must be instances of Middleware")
 
-    final_indices: list[int] = [i for i, mw in enumerate(middleware) if mw.is_final]
+    deduplicated: list[Middleware] = []
+    for mw in middleware:
+        if any(m is mw for m in deduplicated):
+            logger.warning(
+                "Middleware %s is registered more than once; the duplicate registration is ignored. "
+                "The same middleware instance must not be added to a function more than once.",
+                type(mw).__name__,
+            )
+            continue
+        deduplicated.append(mw)
+
+    final_indices: list[int] = [i for i, mw in enumerate(deduplicated) if mw.is_final]
 
     if len(final_indices) > 1:
-        names: str = ", ".join(type(middleware[i]).__name__ for i in final_indices)
+        names: str = ", ".join(type(deduplicated[i]).__name__ for i in final_indices)
         raise ValueError(f"Only one final middleware may be specified per function, but found multiple: {names}")
 
-    if final_indices and final_indices[0] != len(middleware) - 1:
-        name: str = type(middleware[final_indices[0]]).__name__
+    if final_indices and final_indices[0] != len(deduplicated) - 1:
+        name: str = type(deduplicated[final_indices[0]]).__name__
         raise ValueError(f"{name} is marked as final but is not the last middleware in the chain")
 
-    return tuple(middleware)
+    return tuple(deduplicated)
 
 
 __all__ = [

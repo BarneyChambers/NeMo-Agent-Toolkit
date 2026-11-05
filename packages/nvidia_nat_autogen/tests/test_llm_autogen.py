@@ -80,14 +80,27 @@ class TestPatchAutoGenClient:
         retry_config.num_retries = 5
         retry_config.retry_on_status_codes = [500, 503]
         retry_config.retry_on_errors = ["timeout", "connection"]
+        retry_config.retry_max_wait = 10.0
 
         result = _patch_autogen_client_based_on_config(mock_client, retry_config)
 
         mock_patch_retry.assert_called_once_with(mock_client,
                                                  retries=5,
+                                                 max_wait=10.0,
                                                  retry_codes=[500, 503],
                                                  retry_on_messages=["timeout", "connection"])
         assert result == mock_patched_client
+
+    @patch('nat.plugins.autogen.llm.patch_with_retry')
+    def test_patch_with_retry_mixin_disabled(self, mock_patch_retry: Mock):
+        """Test client is not patched when do_auto_retry is False."""
+        mock_client = Mock()
+        retry_config = MockRetryConfig(do_auto_retry=False)
+
+        result = _patch_autogen_client_based_on_config(mock_client, retry_config)
+
+        mock_patch_retry.assert_not_called()
+        assert result == mock_client
 
     @patch('nat.plugins.autogen.llm.patch_with_thinking')
     def test_patch_with_thinking_mixin(self, mock_patch_thinking):
@@ -126,6 +139,7 @@ class TestPatchAutoGenClient:
         # Verify retry is applied first, then thinking
         mock_patch_retry.assert_called_once_with(mock_client,
                                                  retries=3,
+                                                 max_wait=60.0,
                                                  retry_codes=[500, 502],
                                                  retry_on_messages=["timeout"])
         mock_patch_thinking.assert_called_once()
@@ -557,7 +571,7 @@ class TestLLMClientGeneratorsFull:
 
         # Create NIM config
         config = NIMModelConfig(api_key="nim-test-key",
-                                model_name="llama-3.1-70b-instruct",
+                                model_name="nvidia/nemotron-3-super-120b-a12b",
                                 base_url="https://integrate.api.nvidia.com/v1")
         builder = Mock(spec=Builder)
 
@@ -714,6 +728,7 @@ class TestMixinCombinations:
                 # Only retry should be applied
                 mock_patch_retry.assert_called_once_with(mock_client,
                                                          retries=5,
+                                                         max_wait=60.0,
                                                          retry_codes=[500, 502, 503, 504],
                                                          retry_on_messages=["timeout", "connection_error"])
                 mock_patch_thinking.assert_not_called()
@@ -1125,7 +1140,11 @@ class TestErrorHandling:
             # Should not raise, even with edge case values
             result = _patch_autogen_client_based_on_config(mock_client, config)
 
-            mock_patch_retry.assert_called_once_with(mock_client, retries=0, retry_codes=[], retry_on_messages=None)
+            mock_patch_retry.assert_called_once_with(mock_client,
+                                                     retries=0,
+                                                     max_wait=60.0,
+                                                     retry_codes=[],
+                                                     retry_on_messages=None)
             assert result == mock_client
 
     def test_patch_with_unsupported_model_for_thinking(self):

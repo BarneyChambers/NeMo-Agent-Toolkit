@@ -651,7 +651,7 @@ def minio_server_fixture(fail_missing: bool) -> Generator[dict[str, str | int]]:
     except ImportError:
         if fail_missing:
             raise
-        pytest.skip("aioboto3 not installed, skipping MinIO tests")
+        pytest.skip("botocore not installed, skipping MinIO tests")
     except Exception as e:
         if fail_missing:
             raise
@@ -681,7 +681,7 @@ def langfuse_bucket_fixture(fail_missing: bool, minio_server: dict[str, str | in
     except ImportError:
         if fail_missing:
             raise
-        pytest.skip("aioboto3 not installed, skipping MinIO tests")
+        pytest.skip("botocore not installed, skipping MinIO tests")
     except Exception as e:
         if fail_missing:
             raise
@@ -814,34 +814,6 @@ def oauth2_client_credentials_fixture(oauth2_server_url: str, fail_missing: bool
         if fail_missing:
             raise RuntimeError(reason)
         pytest.skip(reason=reason)
-
-
-@pytest.fixture(name="local_sandbox_url", scope="session")
-def local_sandbox_url_fixture(fail_missing: bool) -> str:
-    """Check if sandbox server is running before running tests."""
-    import requests
-    url = os.environ.get("NAT_CI_SANDBOX_URL", "http://127.0.0.1:6000")
-    try:
-        response = requests.get(url, timeout=5)
-        response.raise_for_status()
-        return url
-    except Exception:
-        reason = (f"Sandbox server is not running at {url}. "
-                  "Please start it with: cd src/nat/tool/code_execution/local_sandbox && ./start_local_sandbox.sh")
-        if fail_missing:
-            raise RuntimeError(reason)
-        pytest.skip(reason)
-
-
-@pytest.fixture(name="sandbox_config", scope="session")
-def sandbox_config_fixture(local_sandbox_url: str) -> dict[str, typing.Any]:
-    """Configuration for sandbox testing."""
-    return {
-        "base_url": local_sandbox_url,
-        "execute_url": f"{local_sandbox_url.rstrip('/')}/execute",
-        "timeout": int(os.environ.get("SANDBOX_TIMEOUT", "30")),
-        "connection_timeout": 5
-    }
 
 
 @pytest.fixture(name="piston_url", scope="session")

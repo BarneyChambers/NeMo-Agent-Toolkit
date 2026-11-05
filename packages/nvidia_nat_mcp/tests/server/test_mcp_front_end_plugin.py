@@ -230,7 +230,7 @@ async def test_workflow_alias_with_function_groups():
 
 
 async def test_session_manager_creation_for_workflow_vs_function():
-    """Test that SessionManager.create is called with correct entry_function for workflows vs regular functions."""
+    """Test SessionManager.create usage for shared workflows vs entry functions."""
     from unittest.mock import AsyncMock
     from unittest.mock import MagicMock
     from unittest.mock import patch
@@ -266,6 +266,7 @@ async def test_session_manager_creation_for_workflow_vs_function():
             # Configure the mock to return a mock SessionManager
             mock_session_manager = MagicMock()
             mock_session_manager.workflow = mock_workflow
+            mock_session_manager.is_workflow_per_user = False
             mock_session_create.return_value = mock_session_manager
 
             # Patch register_function_with_mcp to avoid actual registration
@@ -273,28 +274,51 @@ async def test_session_manager_creation_for_workflow_vs_function():
                 # Call the method we're testing
                 await worker._default_add_routes(mock_mcp, mock_builder)
 
-        # Verify SessionManager.create was called twice (once for each function)
+        # Primary manager builds the shared workflow; regular functions get their own entry manager.
         assert mock_session_create.call_count == 2
 
-        # Extract the calls
-        calls = mock_session_create.call_args_list
+        primary_call = mock_session_create.call_args_list[0]
+        function_call = mock_session_create.call_args_list[1]
 
-        # Find the call for the workflow and the call for the regular function
-        workflow_call = None
-        function_call = None
+        assert primary_call.kwargs.get('entry_function') is None
+        assert function_call.kwargs.get('entry_function') == "echo_function"
 
-        for call in calls:
-            # Check the entry_function parameter
-            entry_function = call.kwargs.get('entry_function')
-            if entry_function is None:
-                workflow_call = call
-            else:
-                function_call = call
 
-        # Verify workflow call used entry_function=None
-        assert workflow_call is not None, "Workflow should use entry_function=None"
-        assert workflow_call.kwargs['entry_function'] is None
+@pytest.mark.parametrize(("tool_names", "expected"),
+                         [(["calculator"], {"calculator__add", "calculator__add__internal", "calculator__subtract"}),
+                          (["calculator__add"], {"calculator__add"})],
+                         ids=["group", "exact_function"])
+async def test_tool_names_accepts_function_group_name(tool_names: list[str], expected: set[str]):
+    """Test that a group name in tool_names publishes the whole group and an exact function name only that function."""
+    from unittest.mock import AsyncMock
+    from unittest.mock import MagicMock
+    from unittest.mock import patch
 
-        # Verify regular function call used entry_function=function_name
-        assert function_call is not None, "Function should use entry_function=<name>"
-        assert function_call.kwargs['entry_function'] == "echo_function"
+    from nat.builder.function import FunctionGroup
+    from nat.builder.workflow_builder import WorkflowBuilder
+    from nat.plugins.mcp.server.front_end_plugin_worker import MCPFrontEndPluginWorker
+
+    config = Config(general=GeneralConfig(front_end=MCPFrontEndConfig(tool_names=tool_names)),
+                    workflow=EchoFunctionConfig())
+    worker = MCPFrontEndPluginWorker(config)
+
+    sep = FunctionGroup.SEPARATOR
+    all_functions = {
+        f"calculator{sep}add": MagicMock(),
+        f"calculator{sep}add{sep}internal": MagicMock(),
+        f"calculator{sep}subtract": MagicMock(),
+        f"calculator_extra{sep}add": MagicMock(),
+        "current_datetime": MagicMock(),
+    }
+
+    with patch.object(worker, '_get_all_functions', return_value=all_functions):
+        with patch('nat.plugins.mcp.server.front_end_plugin_worker.SessionManager.create',
+                   new_callable=AsyncMock) as mock_session_create:
+            with patch('nat.plugins.mcp.server.tool_converter.register_function_with_mcp'):
+                await worker._default_add_routes(MagicMock(), MagicMock(spec=WorkflowBuilder))
+
+    published = {
+        call.kwargs['entry_function']
+        for call in mock_session_create.call_args_list if call.kwargs.get('entry_function') is not None
+    }
+    assert published == expected

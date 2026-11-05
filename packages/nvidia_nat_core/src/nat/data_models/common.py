@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from pydantic import Field
 from pydantic import PlainSerializer
 from pydantic import SecretStr
+from pydantic import SerializationInfo
 from pydantic.json_schema import GenerateJsonSchema
 from pydantic.json_schema import JsonSchemaMode
 
@@ -40,16 +41,28 @@ class HashableBaseModel(BaseModel):
             'utf-8', errors='ignore')).digest(),
                               byteorder=sys.byteorder)
 
+    # The comparisons are defined on the hash so that two instances with the same class and field values compare
+    # equal. They only make sense against another HashableBaseModel; for anything else Python gets NotImplemented
+    # and falls back to its default behaviour, instead of the TypeError that ``other.__hash__()`` raises for an
+    # unhashable operand such as a dict or list.
     def __lt__(self, other):
+        if not isinstance(other, HashableBaseModel):
+            return NotImplemented
         return self.__hash__() < other.__hash__()
 
     def __eq__(self, other):
+        if not isinstance(other, HashableBaseModel):
+            return NotImplemented
         return self.__hash__() == other.__hash__()
 
     def __ne__(self, other):
+        if not isinstance(other, HashableBaseModel):
+            return NotImplemented
         return self.__hash__() != other.__hash__()
 
     def __gt__(self, other):
+        if not isinstance(other, HashableBaseModel):
+            return NotImplemented
         return self.__hash__() > other.__hash__()
 
     @classmethod
@@ -211,8 +224,20 @@ def set_secret_from_env(model: BaseModel, field_name: str, env_var: str):
         setattr(model, field_name, SecretStr(env_value))
 
 
+def _serialize_secret(v: SecretStr | None, info: SerializationInfo) -> str | None:
+    """
+    Serialize a SecretStr to its plain value, or to its masked form when the dump is called with
+    ``context={"mask_secrets": True}``.
+    """
+    if v is None:
+        return None
+    if info.context and info.context.get("mask_secrets"):
+        return str(v)
+    return v.get_secret_value()
+
+
 # A SecretStr that serializes to plain string
-SerializableSecretStr = typing.Annotated[SecretStr, PlainSerializer(get_secret_value)]
+SerializableSecretStr = typing.Annotated[SecretStr, PlainSerializer(_serialize_secret)]
 
 # A SecretStr or None that serializes to plain string
-OptionalSecretStr = typing.Annotated[SecretStr | None, PlainSerializer(get_secret_value)]
+OptionalSecretStr = typing.Annotated[SecretStr | None, PlainSerializer(_serialize_secret)]

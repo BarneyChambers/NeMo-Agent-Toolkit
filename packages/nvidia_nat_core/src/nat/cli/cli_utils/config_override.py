@@ -84,8 +84,16 @@ class LayeredConfig:
                     if lower_value not in ['true', 'false']:
                         raise ValueError(f"Boolean value must be 'true' or 'false', got '{value}'")
                     value = lower_value == 'true'
-                elif isinstance(original_value, int | float):
-                    value = type(original_value)(value)
+                elif isinstance(original_value, float):
+                    value = float(value)
+                elif isinstance(original_value, int):
+                    # YAML loads `temperature: 0` as int even when the field is a float, so a
+                    # fractional override must not be rejected here; pydantic validation of the
+                    # effective config still rejects it for fields that are really ints.
+                    try:
+                        value = int(value)
+                    except ValueError:
+                        value = float(value)
                 elif isinstance(original_value, list):
                     value = [v.strip() for v in value.split(',')]
                 elif isinstance(original_value, Path):
@@ -98,9 +106,10 @@ class LayeredConfig:
             self.overrides[path] = value
             self._effective_config = None
 
-            log_msg = f"Successfully set override for {path} with value: {value}"
+            # The value is deliberately left out: it can be a secret, or an expanded environment variable.
+            log_msg = f"Successfully set override for {path}"
             if not isinstance(original_value, _Placeholder):
-                log_msg += f" with type {type(value)})"
+                log_msg += f" with type {type(value)}"
 
             logger.info(log_msg)
 
@@ -207,11 +216,9 @@ def load_and_override_config(config_file: Path, overrides: tuple[tuple[str, str]
         try:
             # Validate using the temporary file
             validate_yaml(None, None, tmp_path)
-            # If validation succeeds, print the config
-            logger.info(
-                "\n\nConfiguration after overrides:\n\n%s",
-                yaml.dump(effective_config, default_flow_style=False),
-            )
+            # If validation succeeds, report which paths were overridden. The effective config is not logged because
+            # environment variable references are already expanded by this point, so it can contain secrets.
+            logger.info("Configuration validated after overriding: %s", ", ".join(sorted(config.overrides)))
         except Exception as e:
             logger.error("Modified configuration failed validation: %s", e)
             raise click.BadParameter(f"Modified configuration failed validation: {str(e)}")

@@ -404,6 +404,48 @@ Timeout middleware extends `DynamicFunctionMiddleware`, enabling interception of
 - **Streaming**: Enforces the time limit across the entire stream duration, not per-chunk
 - **Error handling**: Raises `TimeoutError` with the configured `timeout_message`
 
+### Circuit Breaker Middleware
+
+The circuit breaker middleware (`_type: circuit_breaker`) implements the Circuit Breaker pattern to protect workflows from cascading failures by isolating failing functions and external services.
+
+#### States
+
+The circuit breaker operates as a state machine with three states:
+
+- **CLOSED** (Normal Operation): Function calls pass through normally. Consecutive downstream exceptions increment the failure counter. When `failure_threshold` is reached, the circuit breaker trips to `OPEN`.
+- **OPEN** (Failing / Short-Circuiting): Function calls are short-circuited immediately without executing the downstream function, raising `CircuitBreakerOpenError`. When `cooldown_period` elapses, the circuit breaker transitions to `HALF_OPEN`.
+- **HALF_OPEN** (Probing): Allows limited probe calls to test if the downstream service has recovered. Concurrent calls while a probe is in flight are short-circuited. If `probe_timeout` is configured, probe calls time out after the specified duration. The circuit breaker recovers to `CLOSED` after `half_open_success_threshold` consecutive successful probes, or re-trips to `OPEN` on failure or timeout.
+
+#### Configuration
+
+```yaml
+middleware:
+  tool_circuit_breaker:
+    _type: circuit_breaker
+    failure_threshold: 3
+    cooldown_period: 60.0
+    half_open_success_threshold: 1
+    probe_timeout: 5.0
+    circuit_breaker_message: "The downstream service is temporarily unavailable. Please retry later."
+```
+
+#### Parameters
+
+- **`failure_threshold`** (`int`, default=`3`): Number of consecutive failures required to trip the circuit breaker into `OPEN` state (must be greater than zero).
+- **`cooldown_period`** (`float`, default=`60.0`): Time in seconds to wait in `OPEN` state before transitioning to `HALF_OPEN` to probe availability (must be greater than zero).
+- **`half_open_success_threshold`** (`int`, default=`1`): Number of consecutive successful probe calls in `HALF_OPEN` state required to recover to `CLOSED` state (must be greater than zero).
+- **`probe_timeout`** (`float | None`, default=`None`): Optional timeout in seconds for probe calls in `HALF_OPEN` state (must be greater than zero if set).
+- **`circuit_breaker_message`** (`str | None`, default=`None`): Optional custom message appended to the error message when calls are short-circuited while the circuit breaker is `OPEN`.
+
+Circuit breaker middleware extends `DynamicFunctionMiddleware`, enabling dynamic component interception as well as targeting specific workflow functions.
+
+#### Behavior
+
+- **Single invocations**: Intercepts downstream execution, short-circuiting calls and raising `CircuitBreakerOpenError` when `OPEN`.
+- **Streaming**: Intercepts streaming generators, enforcing state tracking and timeout per-stream.
+- **Cancellation safety**: Task cancellations (`asyncio.CancelledError`) during `HALF_OPEN` release probe status without counting as a failure or modifying the circuit breaker state.
+- **Target isolation**: Circuit breaker state is tracked independently per tool or target function.
+
 ### HITL Middleware
 
 The HITL (Human-in-the-Loop) middleware (`HITLMiddleware`) is an abstract base class for intercept patterns that require a human decision before or after a function call. It integrates directly with the `UserInteractionManager` to display any configured `HumanPrompt` at two points in the function lifecycle: before the call (`pre_invoke`) and after it returns (`post_invoke`). Each phase delegates the handling of the human response to two abstract methods that subclasses must implement, leaving the decision logic entirely to the implementer.
@@ -419,7 +461,7 @@ Both abstract methods receive the `InteractionResponse` from the user and the cu
 
 #### Configuration
 
-`HITLMiddlewareConfig` is the base configuration class. It has no YAML `_type` of its own — because `HITLMiddleware` is abstract, concrete subclasses must declare their own `name` to be runnable. It provides two prompt fields and inherits all function-targeting fields from `DynamicMiddlewareConfig`.
+`HITLMiddlewareConfig` is the base configuration class and has no YAML `_type` of its own. Because `HITLMiddleware` is abstract, concrete subclasses must declare their own `name` to be runnable. It provides two prompt fields and inherits all function-targeting fields from `DynamicMiddlewareConfig`.
 
 - **`pre_invoke_prompt`**: Any `HumanPrompt` to display before the function is called. Omit or set to `null` to disable pre-invoke interaction.
 - **`post_invoke_prompt`**: Any `HumanPrompt` to display after the function returns. Omit or set to `null` to disable post-invoke interaction.
@@ -998,6 +1040,31 @@ Solution: Ensure the register module is imported. NeMo Agent Toolkit automatical
 - Use exact matching (threshold=1.0) for caching
 - Reduce logging verbosity
 - Consider async operations
+
+## Middleware Telemetry
+
+Each enabled function middleware emits paired `SPAN_START` and `SPAN_END`
+intermediate steps named after its class. The span surrounds the middleware's
+invocation, including downstream middleware and the function it delegates to;
+its duration is inclusive rather than a measurement of exclusive middleware
+overhead. Disabled middleware emits no steps.
+
+NeMo Guardrails additionally emits `GUARDRAIL_START` and `GUARDRAIL_END` for each
+input or output policy evaluation. Live output-rail streaming uses one
+`guardrails.output.stream` span for the stream lifetime. Intermediate-step and
+span exporters receive the same paired events on normal completion, refusal,
+exceptions, and stream closure. Buffered streaming records its final output;
+generic streaming records the last emitted chunk without accumulating the stream.
+
+NeMo Guardrails middleware also attaches the existing LangChain profiler to native
+rail models and rail models bound from NeMo Agent Toolkit. Their LLM spans include
+model names, prompts, responses, and provider-reported token usage for ordinary and
+live streaming calls. Existing model callbacks are preserved, and an active
+workflow profiler takes precedence to avoid duplicate LLM spans. Providers that do
+not report token usage retain zero counts; the middleware does not estimate tokens.
+
+Middleware inputs and outputs follow the configured telemetry exporters' existing
+payload and redaction rules.
 
 ## API Reference
 

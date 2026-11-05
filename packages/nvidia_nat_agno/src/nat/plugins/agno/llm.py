@@ -60,9 +60,10 @@ def _patch_llm_based_on_config(client: ModelType, llm_config: LLMBaseConfig) -> 
                 messages.insert(0, Message(role="system", content=self.system_prompt))
             return FunctionArgumentWrapper(messages, *args, **kwargs)
 
-    if isinstance(llm_config, RetryMixin):
+    if isinstance(llm_config, RetryMixin) and llm_config.do_auto_retry:
         client = patch_with_retry(client,
                                   retries=llm_config.num_retries,
+                                  max_wait=llm_config.retry_max_wait,
                                   retry_codes=llm_config.retry_on_status_codes,
                                   retry_on_messages=llm_config.retry_on_errors)
 

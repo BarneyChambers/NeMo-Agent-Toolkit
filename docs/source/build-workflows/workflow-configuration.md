@@ -42,7 +42,7 @@ functions:
     _type: webpage_query
     webpage_url: https://docs.smith.langchain.com
     description: "Search for information about LangSmith. For any questions about LangSmith, you must use this tool!"
-    embedder_name: nv-embedqa-e5-v5
+    embedder_name: nemotron-3-embed-1b
     chunk_size: 512
   current_datetime:
     _type: current_datetime
@@ -50,13 +50,13 @@ functions:
 llms:
   nim_llm:
     _type: nim
-    model_name: meta/llama-3.1-70b-instruct
+    model_name: nvidia/nemotron-3-super-120b-a12b
     temperature: 0.0
 
 embedders:
-  nv-embedqa-e5-v5:
+  nemotron-3-embed-1b:
     _type: nim
-    model_name: nvidia/nv-embedqa-e5-v5
+    model_name: nvidia/nemotron-3-embed-1b
 
 workflow:
   _type: react_agent
@@ -76,7 +76,7 @@ The `functions` section contains the tools used in the workflow, in our example 
 This section contains the models used in the workflow. The `_type` value refers to the API hosting the model, in this case `nim` refers to an NIM model hosted on [`build.nvidia.com`](https://build.nvidia.com).
 
 <!-- path-check-skip-next-line -->
-The `model_name` value then needs to match a model hosted by the API, in our example we are using the [`meta/llama-3.1-70b-instruct`](https://build.nvidia.com/meta/llama-3_1-70b-instruct) model.
+The `model_name` value needs to match a model hosted by the API. In this example, we use the [`nvidia/nemotron-3-super-120b-a12b`](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b) model.
 
 Each type of API supports specific attributes. For `nim` these are defined in the {py:class}`~nat.llm.nim_llm.NIMModelConfig` class.
 
@@ -84,7 +84,7 @@ See the [LLMs](./llms/index.md) documentation for more information.
 
 ### `embedders`
 <!-- path-check-skip-next-line -->
-This section follows a the same structure as the `llms` section and serves as a way to separate the embedding models from the LLM models. In our example, we are using the [`nvidia/nv-embedqa-e5-v5`](https://build.nvidia.com/nvidia/nv-embedqa-e5-v5) model.
+This section follows a the same structure as the `llms` section and serves as a way to separate the embedding models from the LLM models. In our example, we are using the [`nvidia/nemotron-3-embed-1b`](https://build.nvidia.com/nvidia/nemotron-3-embed-1b) model.
 
 See the [Embedders](./embedders.md) documentation for more information.
 
@@ -151,6 +151,11 @@ The environment variable interpolation process follows the rules below.
 
 Bare `$VAR` (without braces) is not supported. Use `${VAR}` instead.
 
+If YAML parsing fails, the error reports the parser error type and, when available,
+the line and column in the parser input. Configuration contents and
+parser source snippets are omitted from logs and rendered exception output because they
+can contain credentials from environment variables.
+
 ### Configuration Inheritance
 
 NeMo Agent Toolkit supports configuration inheritance to reduce duplication across similar configuration files. Use the `base` key to reference a base configuration and selectively override specific values. For example, given a base configuration:
@@ -159,7 +164,7 @@ NeMo Agent Toolkit supports configuration inheritance to reduce duplication acro
 # base-config.yml
 llms:
   nim_llm:
-    model_name: meta/llama-3.1-70b-instruct
+    model_name: nvidia/nemotron-3-super-120b-a12b
     temperature: 0.0
     max_tokens: 1024
 ```
@@ -209,6 +214,7 @@ functions:
 The file loading follows these rules:
 
 - **Value format**: The value must start with `file://`
+- **Lists**: Values inside lists are not resolved and are kept as the literal `file://` string
 - **Path resolution**: Relative paths are resolved from the configuration file's directory. Absolute paths are also supported
 - **Allowed extensions**: For security, only these file extensions are permitted: `.txt`, `.md`, `.j2`, `.jinja2`, `.jinja`, `.prompt`, `.tpl`, `.template`
 

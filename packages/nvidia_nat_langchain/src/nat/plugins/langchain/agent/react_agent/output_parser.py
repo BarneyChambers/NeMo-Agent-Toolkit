@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import re
+import typing
 
 from langchain_classic.agents.agent import AgentOutputParser
 from langchain_core.agents import AgentAction
@@ -114,13 +116,22 @@ class ReActOutputParser(AgentOutputParser):
     def parse(self, text: str) -> AgentAction | AgentFinish:
         includes_answer = bool(FINAL_ANSWER_PATTERN.search(text))
 
+        # Models sometimes answer with a JSON object instead of the text format, e.g.
+        # {"Thought": "...", "Action": "search", "Action Input": {...}}. Its quoted keys do not
+        # match the patterns below, so parse that shape first and run the requested tool.
+        json_action = self._parse_json_action(text)
+        if json_action is not None:
+            return json_action
+
         # More lenient regex patterns (case-insensitive):
         # 1. Primary pattern: "Action: X Action Input: Y" or "Action: X Input: Y"
         # 2. Accepts variations in whitespace and optional "Action" prefix before "Input"
+        # 3. The input ends at an "Observation" marker: the word followed by ":" or the end of the text. The word
+        #    inside the input ("weather observation stations", or a line starting "Observation bias") is kept.
         regex_primary = (
             r"action\s*\d*\s*:\s*(.*?)\s*"  # "Action:" (case-insensitive)
             r"(?:action\s*\d*\s*)?input\s*\d*\s*:\s*"  # "Action Input:" or just "Input:"
-            r"(.*?)(?=\s*[\n|\s]\s*observation\b|$)"  # Until "Observation" or end
+            r"(.*?)(?=\s+observation\s*(?::|$)|$)"  # Until the "Observation" marker or end
         )
         action_match = re.search(regex_primary, text, re.DOTALL | re.IGNORECASE)
         if action_match:
@@ -153,6 +164,64 @@ class ReActOutputParser(AgentOutputParser):
                                              missing_action_input=True,
                                              llm_output=text)
         raise ReActOutputParserException("Could not parse LLM output", llm_output=text)
+
+    @staticmethod
+    def _parse_json_action(text: str) -> AgentAction | None:
+        """Parse a JSON-object ReAct step, or return None when `text` is not one.
+
+        Args:
+            text: The raw model output.
+
+        Returns:
+            An ``AgentAction`` when `text` is a JSON object carrying an ``Action`` key,
+            otherwise None (including JSON objects without one).
+
+        Raises:
+            ReActOutputParserException: When the JSON object has an ``Action`` key with an unusable
+                value, or carries no action input.
+        """
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        action: typing.Any = None
+        action_present = False
+        action_input: typing.Any = None
+        fallback_input: typing.Any = None
+        for key, value in parsed.items():
+            if not isinstance(key, str):
+                continue
+            normalized_key = key.strip().lower().replace("_", " ")
+            if normalized_key == "action":
+                action_present = True
+                action = value
+            elif normalized_key == "action input":
+                action_input = value
+            elif normalized_key == "input" and fallback_input is None:
+                fallback_input = value
+
+        if not action_present:
+            return None
+        # An Action key with a null, blank, or non-string value is still a failed parse, not a
+        # direct answer, so raise a retry-compatible error instead of falling through.
+        if not isinstance(action, str) or not action.strip():
+            raise ReActOutputParserException("Could not parse LLM output", llm_output=text)
+        action = action.strip()
+        if action_input is None:
+            action_input = fallback_input
+        if action_input is None:
+            raise ReActOutputParserException(observation=MISSING_ACTION_INPUT_AFTER_ACTION_ERROR_MESSAGE,
+                                             missing_action_input=True,
+                                             llm_output=text)
+
+        tool_input = action_input if isinstance(action_input, str) else json.dumps(action_input)
+        return AgentAction(action, tool_input, text)
 
     @property
     def _type(self) -> str:
